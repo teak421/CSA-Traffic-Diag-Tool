@@ -58,6 +58,11 @@ EGRESS_IP_SERVICES = (
     "https://checkip.amazonaws.com",
 )
 
+# IP Chicken — used as the bypass-side egress check.
+# Add ipchicken.com to your Cisco Secure Access traffic steering bypass list;
+# the tool will compare its IP against the tunneled egress to confirm bypass works.
+IPCHICKEN_URL = "http://ipchicken.com"
+
 # Tunnel interface name patterns (matched case-insensitively)
 # macOS ZTA uses utun*; Windows uses virtual adapters named "Cisco *"
 TUNNEL_IFACE_PATTERNS = ("utun", "cisco", "csc_", "anyconnect")
@@ -619,6 +624,25 @@ def _fetch_egress_ip():
     return None, None
 
 
+def _fetch_ipchicken_ip():
+    """Fetch egress IP from ipchicken.com by parsing its HTML response.
+
+    ipchicken.com should be added to the Cisco Secure Access traffic steering
+    bypass list so that this request exits via the ISP rather than Cisco's tunnel.
+    Returns the IP string on success, or None on failure.
+    """
+    try:
+        req = Request(IPCHICKEN_URL, headers={"User-Agent": "csa_traffic_diag"})
+        with urlopen(req, timeout=TIMEOUT) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", html)
+        if match:
+            return match.group(1)
+    except (URLError, OSError, ValueError):
+        pass
+    return None
+
+
 def check_egress_ip():
     """Check the public egress IP and determine if it belongs to Cisco."""
     ip, source = _fetch_egress_ip()
@@ -662,6 +686,46 @@ def check_egress_ip():
             "verdict": verdict,
         },
     )
+
+
+def print_egress_comparison(color):
+    """Print a side-by-side egress IP comparison at the top of tool output.
+
+    Fetches the egress IP via the normal tunneled path (likely Cisco) and via
+    ipchicken.com (which should be on the traffic steering bypass list).  The
+    two IPs together let the user instantly confirm whether bypass is working:
+    they should differ when ipchicken.com is correctly bypassed.
+    """
+    tunneled_ip, _ = _fetch_egress_ip()
+    bypass_ip = _fetch_ipchicken_ip()
+
+    label_w = 20  # column width for labels
+    print(f"  {color.bold('Egress IP Check:')}")
+
+    if tunneled_ip:
+        print(f"    {'Tunneled (Cisco):':<{label_w}} {color.yellow(tunneled_ip)}"
+              f"  {color.dim('← not in traffic steering bypass')}")
+    else:
+        print(f"    {'Tunneled (Cisco):':<{label_w}} {color.dim('unreachable')}")
+
+    if bypass_ip:
+        if bypass_ip == tunneled_ip:
+            print(
+                f"    {'Bypass (ISP):':<{label_w}} {color.yellow(bypass_ip)}"
+                f"  {color.dim('← same as tunnel — ipchicken.com may not be on bypass list')}"
+            )
+        else:
+            print(
+                f"    {'Bypass (ISP):':<{label_w}} {color.green(bypass_ip)}"
+                f"  {color.dim('← ipchicken.com (traffic steering bypass)')}"
+            )
+    else:
+        print(
+            f"    {'Bypass (ISP):':<{label_w}} {color.dim('unreachable')}  "
+            f"{color.dim('← add ipchicken.com to traffic steering bypass list')}"
+        )
+
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -2431,6 +2495,7 @@ def main():
 
     if not args.json:
         print(color.banner())
+        print_egress_comparison(color)
 
     # Discover mode: scan, categorize, verify
     if args.discover:

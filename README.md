@@ -177,6 +177,35 @@ sudo csa-traffic-diag --discover --verify --json > results.json
 if [ $? -eq 2 ]; then echo "Warnings found -- review results.json"; fi
 ```
 
+## Verifying Traffic Steering Bypass
+
+The tool displays a dual egress IP comparison at the top of every run so you can instantly confirm whether your traffic steering bypass policy is working.
+
+### Setup
+
+Add `ipchicken.com` to your **Traffic Steering Bypass** list in the Cisco Secure Access dashboard (Policy → Traffic Steering). Once added, requests to ipchicken.com will exit directly through your ISP rather than Cisco's tunnel.
+
+### What You'll See
+
+```
+  Egress IP Check:
+    Tunneled (Cisco):    146.112.x.x   ← not in traffic steering bypass
+    Bypass (ISP):        98.xx.xx.xx   ← ipchicken.com (traffic steering bypass)
+```
+
+- **Tunneled** — the egress IP for normal traffic routed through Cisco Secure Access
+- **Bypass** — the egress IP fetched from `ipchicken.com`; should show your ISP's public IP
+
+If both IPs are the **same**, ipchicken.com is not yet on the bypass list (or your bypass policy hasn't taken effect).
+
+If ipchicken.com is **unreachable**, the tool will prompt you to add it to the bypass list.
+
+### Important: Bypass ≠ Do Not Decrypt
+
+> ⚠️ **The Do Not Decrypt list is not the same as Traffic Steering Bypass.**
+>
+> Domains on the *Do Not Decrypt* list are still **proxied through Cisco Secure Access** — your traffic still exits via Cisco's IP. TLS inspection is simply skipped. Only domains on the *Traffic Steering Bypass* list are routed directly through your ISP and will show the ISP egress IP.
+
 ## How It Works
 
 ### TLS Interception Detection
