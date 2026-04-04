@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-04-04
+
+### Added
+- **Interactive domain research** (`--discover --verify`): after printing recommendations, the tool prompts "Research these domains before making changes? [y/N]". On confirmation, it resolves each domain's IPs, performs reverse DNS lookups, and identifies the hosting provider (Akamai, AWS, Cloudflare, Azure, Fastly, Google, etc.). Results are grouped by identified owner — cert organization, hosting provider, or "Unidentified" — so administrators can make informed decisions before adding domains to Do Not Decrypt or Traffic Steering Bypass lists.
+- **`KNOWN_PROVIDERS`** — reverse-DNS substring mapping covering major cloud and CDN providers used for hosting identification during domain research.
+- **SAN capture** in `inspect_tls()`: Subject Alternative Names from the leaf certificate are now stored in the TLS result and displayed during domain research, showing what other domains share the same certificate.
+- **Disclaimer warning** after recommendations: "Do not blindly add domains to the Do Not Decrypt or Traffic Steering lists. Research each domain before adding to any exclusion list."
+- **`_get_cert_org()`** helper: extracts the organization name from a TLS result's leaf certificate subject, skipping Cisco-issued certs (decrypted traffic).
+- **`_resolve_domain_info()`** helper: resolves domain IPs via `socket.getaddrinfo()` and identifies hosting provider by matching reverse DNS hostnames against `KNOWN_PROVIDERS` (limited to 3 IPs per domain to avoid excessive latency).
+
+### Changed
+- `_print_recommendations()` now returns `(actionable_domains, related_decrypted)` so the caller can pass them to the research function.
+- Prompt and research output are suppressed when output is piped (non-TTY), preventing hangs in scripted use.
+
 ## [1.2.0] - 2026-04-04
 
 ### Added

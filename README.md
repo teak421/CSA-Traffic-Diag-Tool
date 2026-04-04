@@ -88,6 +88,37 @@ sudo csa-traffic-diag --discover --verify --minutes 30
 
 When TLS errors are found, the tool prints **actionable recommendations** with the exact domain list to add to Do Not Decrypt, filtering out ephemeral infrastructure noise (STUN/TURN servers, `.arpa` domains, SRV targets).
 
+#### Domain Research
+
+After recommendations print, the tool prompts:
+
+```
+  ⚠️  Do not blindly add domains to the Do Not Decrypt or Traffic Steering lists.
+     Research each domain before adding to any exclusion list.
+
+  Research these domains before making changes? [y/N]:
+```
+
+Answering `y` resolves each domain and identifies its owner by checking the TLS certificate organization and reverse DNS hosting provider (Akamai, AWS, Cloudflare, Azure, Fastly, Google, and others). Results are grouped by owner:
+
+```
+[Domain Research]
+
+  Microsoft (2 domains — identified via Hosting Provider)
+    Hosting:   AWS CloudFront (d1234.cloudfront.net)
+    SANs:      *.office.com, *.microsoft.com, +4 more
+    ─────────────────────────────────────────────────
+    login.microsoftonline.com                          52.98.208.2
+    graph.microsoft.com                                13.107.42.14
+
+  Unidentified (1 domain)
+    ⚠️  Could not identify owner — research manually before adding
+    ─────────────────────────────────────────────────
+    api.unknown-service.io                             (DNS resolution failed)
+```
+
+This step is skipped when output is piped (`| tee log.txt`), so scripted use is unaffected.
+
 ### Domain Diagnosis (`-d`)
 
 Check specific domains for DNS redirection and TLS interception:
@@ -248,7 +279,7 @@ The tool reads Cisco Secure Client log files and databases, matching lines again
 
 ```
 ═══════════════════════════════════════════════════════
-  Cisco Secure Access Traffic Diagnostic Tool v1.4.0
+  Cisco Secure Access Traffic Diagnostic Tool v1.3.0
   Platform: macOS 15.4
   Log path: /opt/cisco/secureclient
 ═══════════════════════════════════════════════════════
@@ -294,6 +325,11 @@ The tool reads Cisco Secure Client log files and databases, matching lines again
     ipv4-c001-sjc001.1.oca.nflxvideo.net
     ipv4-c002-sjc001.1.oca.nflxvideo.net
     ...
+
+  ⚠️  Do not blindly add domains to the Do Not Decrypt or Traffic Steering lists.
+     Research each domain before adding to any exclusion list.
+
+  Research these domains before making changes? [y/N]:
 ```
 
 ## Interpreting Results
