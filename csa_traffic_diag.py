@@ -94,6 +94,49 @@ KNOWN_PROVIDERS = (
     ("cisco.com", "Cisco"),
 )
 
+# Domain suffix → owner name for well-known services whose IPs lack useful reverse DNS.
+# Checked as a fallback when cert org and reverse DNS both fail to identify the owner.
+# More specific suffixes must come before less specific ones (first match wins).
+KNOWN_DOMAIN_OWNERS = (
+    (".icloud.com", "Apple"),
+    (".apple.com", "Apple"),
+    (".mzstatic.com", "Apple"),
+    (".microsoft.com", "Microsoft"),
+    (".office.com", "Microsoft"),
+    (".office365.com", "Microsoft"),
+    (".windows.com", "Microsoft"),
+    (".live.com", "Microsoft"),
+    (".msftconnecttest.com", "Microsoft"),
+    (".azure.com", "Microsoft Azure"),
+    (".googleapis.com", "Google"),
+    (".gstatic.com", "Google"),
+    (".google.com", "Google"),
+    (".youtube.com", "Google"),
+    (".ytimg.com", "Google"),
+    (".amazon.com", "Amazon"),
+    (".amazonaws.com", "AWS"),
+    (".webex.com", "Cisco Webex"),
+    (".cisco.com", "Cisco"),
+    (".zoom.us", "Zoom"),
+    (".zoomgov.com", "Zoom"),
+    (".akamaized.net", "Akamai"),
+    (".akamai.com", "Akamai"),
+    (".cloudflare.com", "Cloudflare"),
+    (".fastly.com", "Fastly"),
+    (".okta.com", "Okta"),
+    (".oktacdn.com", "Okta"),
+    (".salesforce.com", "Salesforce"),
+    (".force.com", "Salesforce"),
+    (".dropbox.com", "Dropbox"),
+    (".dropboxstatic.com", "Dropbox"),
+    (".box.com", "Box"),
+    (".boxcdn.net", "Box"),
+    (".slack.com", "Slack"),
+    (".slack-edge.com", "Slack"),
+    (".github.com", "GitHub"),
+    (".githubusercontent.com", "GitHub"),
+)
+
 # Regex for log scanning keywords
 LOG_PATTERNS = re.compile(
     r"\b(block(?:ed)?|deny|denied|drop(?:ped)?|refused|certificate"
@@ -384,6 +427,20 @@ def _parse_cert_tuple_field(field_tuples):
         for attr_type, attr_value in rdn:
             parts.append(f"{attr_type}={attr_value}")
     return ", ".join(parts)
+
+
+def _identify_by_domain_name(domain):
+    """Identify a domain's owner from its name using KNOWN_DOMAIN_OWNERS suffixes.
+
+    Returns owner name string or None. Used as a fallback when cert org and
+    reverse DNS both fail — common for Apple, Google, and other large operators
+    whose IP ranges have no meaningful reverse DNS.
+    """
+    dl = domain.lower()
+    for suffix, owner in KNOWN_DOMAIN_OWNERS:
+        if dl == suffix.lstrip(".") or dl.endswith(suffix):
+            return owner
+    return None
 
 
 def _get_cert_org(tls_result):
@@ -2695,7 +2752,7 @@ def _research_domains(actionable, related, discovery, color):
         if sans:
             base_sans[base] = sans
 
-    # Determine owner for each domain: cert org → hosting provider → Unidentified
+    # Determine owner for each domain: cert org → hosting provider → domain name → Unidentified
     domain_owner = {}  # domain -> (owner_name, id_method)
     for domain in all_domains:
         data = domain_data[domain]
@@ -2704,6 +2761,8 @@ def _research_domains(actionable, related, discovery, color):
         elif data.get("provider"):
             pname, _ = data["provider"]
             domain_owner[domain] = (pname, "Hosting Provider")
+        elif name_owner := _identify_by_domain_name(domain):
+            domain_owner[domain] = (name_owner, "Domain Name")
         else:
             domain_owner[domain] = ("Unidentified", None)
 
