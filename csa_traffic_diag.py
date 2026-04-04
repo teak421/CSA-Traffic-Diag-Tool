@@ -429,6 +429,32 @@ def _parse_cert_tuple_field(field_tuples):
     return ", ".join(parts)
 
 
+def _is_zta_enrolled():
+    """Check if this endpoint has an active ZTA enrollment.
+
+    Looks for enrollment JSON files in the ZTA enrollments directory.
+    These files are world-readable (no sudo required) and their presence
+    means the endpoint is enrolled in a ZTA profile — which means the
+    ZTA profile's Secure Internet Access exceptions control traffic
+    steering, NOT the Internet Security > Traffic Steering page.
+    """
+    if IS_MACOS:
+        enroll_dir = CSC_BASE / "zta" / "enrollments"
+    elif IS_WINDOWS:
+        enroll_dir = CSC_BASE / "ZTA" / "enrollments"
+    else:
+        return False
+    try:
+        if enroll_dir.is_dir():
+            return any(
+                f.suffix == ".json" and f.parent == enroll_dir
+                for f in enroll_dir.iterdir()
+            )
+    except OSError:
+        pass
+    return False
+
+
 def _identify_by_domain_name(domain):
     """Identify a domain's owner from its name using KNOWN_DOMAIN_OWNERS suffixes.
 
@@ -847,9 +873,26 @@ def print_egress_comparison(color):
     ipchicken.com (which should be on the traffic steering bypass list).  The
     two IPs together let the user instantly confirm whether bypass is working:
     they should differ when ipchicken.com is correctly bypassed.
+
+    Helper text is context-aware: ZTA-enrolled endpoints use the ZTA profile's
+    Secure Internet Access exceptions, while non-ZTA endpoints (Umbrella, SWG)
+    use the Internet Security > Traffic Steering page.
     """
     tunneled_ip, _ = _fetch_egress_ip()
     bypass_ip = _fetch_ipchicken_ip()
+    zta = _is_zta_enrolled()
+
+    # Context-aware helper text for where to configure bypass
+    if zta:
+        tunneled_hint = "tunneled via ZTA (Cisco Secure Access)"
+        bypass_ok_hint = "ipchicken.com — ZTA profile bypass exception active"
+        bypass_fail_hint = "still Cisco — add ipchicken.com to ZTA profile exceptions (Secure Internet Access)"
+        bypass_add_hint = "add ipchicken.com to ZTA profile exceptions (Secure Internet Access)"
+    else:
+        tunneled_hint = "tunneled via Cisco Secure Access"
+        bypass_ok_hint = "ipchicken.com — Internet Security traffic steering bypass active"
+        bypass_fail_hint = "still Cisco — add ipchicken.com to Internet Security > Traffic Steering"
+        bypass_add_hint = "add ipchicken.com to Internet Security > Traffic Steering"
 
     label_w = 20  # column width for labels
     print(f"  {color.bold('Egress IP Check:')}")
@@ -857,7 +900,7 @@ def print_egress_comparison(color):
     if tunneled_ip:
         print(
             f"    {'Tunneled (Cisco):':<{label_w}} {color.yellow(tunneled_ip)}"
-            f"  {color.dim('← not in traffic steering bypass')}"
+            f"  {color.dim('← ' + tunneled_hint)}"
         )
     else:
         print(f"    {'Tunneled (Cisco):':<{label_w}} {color.dim('unreachable')}")
@@ -866,17 +909,17 @@ def print_egress_comparison(color):
         if bypass_ip == tunneled_ip or is_cisco_ip(bypass_ip):
             print(
                 f"    {'Bypass (ISP):':<{label_w}} {color.yellow(bypass_ip)}"
-                f"  {color.dim('← still Cisco — ipchicken.com not on bypass, or ZTA sync pending')}"
+                f"  {color.dim('← ' + bypass_fail_hint)}"
             )
         else:
             print(
                 f"    {'Bypass (ISP):':<{label_w}} {color.green(bypass_ip)}"
-                f"  {color.dim('← ipchicken.com (traffic steering bypass)')}"
+                f"  {color.dim('← ' + bypass_ok_hint)}"
             )
     else:
         print(
             f"    {'Bypass (ISP):':<{label_w}} {color.dim('unreachable')}  "
-            f"{color.dim('← add ipchicken.com to traffic steering bypass list')}"
+            f"{color.dim('← ' + bypass_add_hint)}"
         )
 
     print()
