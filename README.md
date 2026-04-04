@@ -1,5 +1,7 @@
 # csa-traffic-diag
 
+[![CodeQL](https://github.com/teak421/CSA-Traffic-Diag-Tool/actions/workflows/codeql.yml/badge.svg)](https://github.com/teak421/CSA-Traffic-Diag-Tool/actions/workflows/codeql.yml)
+
 **CLI diagnostic tool for troubleshooting Cisco Secure Access (SSE) traffic routing on macOS and Windows.**
 
 If you manage Cisco Secure Access (formerly Umbrella SIG / Secure Client with ZTA) in an enterprise environment, you've probably spent hours figuring out why a specific app or website breaks when the client is connected. This tool automates that investigation.
