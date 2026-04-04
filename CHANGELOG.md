@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 - **Disclaimer warning** after recommendations: "Do not blindly add domains to the Do Not Decrypt or Traffic Steering lists. Research each domain before adding to any exclusion list."
 - **`_get_cert_org()`** helper: extracts the organization name from a TLS result's leaf certificate subject, skipping Cisco-issued certs (decrypted traffic).
 - **`_resolve_domain_info()`** helper: resolves domain IPs via `socket.getaddrinfo()` and identifies hosting provider by matching reverse DNS hostnames against `KNOWN_PROVIDERS` (limited to 3 IPs per domain to avoid excessive latency).
+- **`KNOWN_DOMAIN_OWNERS`** — domain suffix-to-owner mapping for well-known services (Apple, Microsoft, Google, Zoom, Okta, Slack, GitHub, etc.) whose IP ranges lack useful reverse DNS. Used as a fallback when cert org and rDNS both fail to identify the owner.
+- **Context-aware egress helper text** — detects ZTA enrollment via local enrollment files and adjusts all egress IP comparison labels to point users to the correct bypass configuration: ZTA profile exceptions (Secure Internet Access) for ZTA-enrolled endpoints, or Internet Security > Traffic Steering for non-ZTA endpoints. Prevents users from adding domains to the wrong bypass list.
+- **File extension filtering** in log scanning — prevents file references like `libMobileGestalt.dylib` (macOS) and `IPCClient.cpp` (Windows) from being treated as domain names. Only filters extensions that are not real gTLDs/ccTLDs to avoid false positives on domains like `play.app`.
 
 ### Changed
 - `_print_recommendations()` now returns `(actionable_domains, related_decrypted)` so the caller can pass them to the research function.

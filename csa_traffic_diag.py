@@ -446,10 +446,7 @@ def _is_zta_enrolled():
         return False
     try:
         if enroll_dir.is_dir():
-            return any(
-                f.suffix == ".json" and f.parent == enroll_dir
-                for f in enroll_dir.iterdir()
-            )
+            return any(f.suffix == ".json" for f in enroll_dir.iterdir())
     except OSError:
         pass
     return False
@@ -494,7 +491,9 @@ def _resolve_domain_info(domain):
     Limits reverse DNS to 3 IPs to avoid excessive latency.
     """
     result = {"ips": [], "rdns": {}, "provider": None}
+    old_timeout = socket.getdefaulttimeout()
     try:
+        socket.setdefaulttimeout(TIMEOUT)
         addrs = socket.getaddrinfo(domain, None, socket.AF_INET)
         ips = list(dict.fromkeys(addr[4][0] for addr in addrs))[:3]
         result["ips"] = ips
@@ -512,6 +511,8 @@ def _resolve_domain_info(domain):
                 pass
     except (socket.gaierror, OSError):
         pass
+    finally:
+        socket.setdefaulttimeout(old_timeout)
     return result
 
 
@@ -2348,13 +2349,16 @@ _PROCESS_ID_PREFIXES = (
 )
 
 # File extensions that DOMAIN_RE matches as TLDs but are source/binary file names
-# appearing in log messages (e.g. libMobileGestalt.dylib, IPCClient.cpp)
+# appearing in log messages (e.g. libMobileGestalt.dylib, IPCClient.cpp).
+# Only includes extensions that are NOT real gTLDs or ccTLDs — excludes .app
+# (gTLD), .py (Paraguay), .js (Jersey), .sh (Saint Helena), .so (Somalia),
+# .rs (Serbia), .mm (Myanmar) to avoid filtering real domains.
 _FILE_EXTENSIONS = frozenset({
-    "cpp", "h", "c", "m", "mm", "swift", "java", "class", "jar",
-    "py", "js", "ts", "rb", "go", "rs",
-    "dylib", "so", "dll", "exe", "app", "sys", "ko",
+    "cpp", "h", "c", "swift", "java", "class", "jar",
+    "ts", "rb", "go",
+    "dylib", "dll", "exe", "sys", "ko",
     "plist", "log", "conf", "cfg", "ini", "json", "xml", "yaml", "yml",
-    "sh", "bat", "cmd", "ps1",
+    "bat", "cmd", "ps1",
 })
 
 
@@ -2368,8 +2372,9 @@ def _is_process_identifier(name):
     lower = name.lower()
     parts = lower.split(".")
 
-    # File extensions masquerading as TLDs
-    if len(parts) >= 2 and parts[-1] in _FILE_EXTENSIONS:
+    # File extensions masquerading as TLDs — only for 2-part names (filename.ext).
+    # Real domains like play.app or api.py have 3+ parts and are not caught here.
+    if len(parts) == 2 and parts[-1] in _FILE_EXTENSIONS:
         return True
 
     # Reverse-DNS subsystem IDs (com.apple.securityd, com.cisco.secureclient.zta)
