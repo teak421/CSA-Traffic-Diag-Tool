@@ -2304,21 +2304,33 @@ _PROCESS_ID_PREFIXES = (
     "com.github.",
 )
 
+# File extensions that DOMAIN_RE matches as TLDs but are source/binary file names
+# appearing in log messages (e.g. libMobileGestalt.dylib, IPCClient.cpp)
+_FILE_EXTENSIONS = frozenset({
+    "cpp", "h", "c", "m", "mm", "swift", "java", "class", "jar",
+    "py", "js", "ts", "rb", "go", "rs",
+    "dylib", "so", "dll", "exe", "app", "sys", "ko",
+    "plist", "log", "conf", "cfg", "ini", "json", "xml", "yaml", "yml",
+    "sh", "bat", "cmd", "ps1",
+})
+
 
 def _is_process_identifier(name):
-    """Check if a string is a macOS subsystem identifier, not a real domain.
+    """Check if a string is a non-domain artifact from log messages.
 
-    Subsystem IDs use reverse-DNS convention (com.cisco.anyconnect.macos.acsockext,
-    com.apple.securityd, com.apple.CFNetwork). They start with known prefixes and
-    have segments that don't look like real TLDs.
+    Catches macOS subsystem IDs (com.cisco.anyconnect.macos.acsockext),
+    file references (libMobileGestalt.dylib, IPCClient.cpp), and other
+    non-domain strings that DOMAIN_RE incorrectly matches.
     """
     lower = name.lower()
+    parts = lower.split(".")
+
+    # File extensions masquerading as TLDs
+    if len(parts) >= 2 and parts[-1] in _FILE_EXTENSIONS:
+        return True
+
+    # Reverse-DNS subsystem IDs (com.apple.securityd, com.cisco.secureclient.zta)
     if any(lower.startswith(prefix) for prefix in _PROCESS_ID_PREFIXES):
-        parts = lower.split(".")
-        # Subsystem IDs: com.apple.securityd (3), com.cisco.secureclient.zta (4), etc.
-        # Real domains: api.cisco.com (3) — but "com" is the TLD
-        # Key difference: subsystem IDs have the TLD-like part FIRST (com.apple)
-        # while real domains have it LAST (api.apple.com)
         if len(parts) >= 3:
             last = parts[-1]
             # Real TLDs are 2-6 chars, all alpha. Subsystem names like
