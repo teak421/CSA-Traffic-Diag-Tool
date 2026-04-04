@@ -361,6 +361,17 @@ csa-traffic-diag --status
 
 ## Security & Privacy
 
+### GitHub Security Scanning
+
+This repository has the following GitHub security features enabled:
+
+- **[CodeQL Analysis](https://github.com/teak421/CSA-Traffic-Diag-Tool/actions/workflows/codeql.yml)** -- automated static analysis runs on every push, pull request, and weekly. Scans for security vulnerabilities, injection flaws, and unsafe code patterns
+- **Secret Scanning** -- monitors the repository for accidentally committed API keys, tokens, and passwords
+- **Push Protection** -- blocks pushes that contain detected secrets before they reach the repository
+- **Dependabot** -- monitors dependencies for known vulnerabilities (this project has zero external dependencies)
+
+### Code Safety
+
 - **No external dependencies** -- nothing to supply-chain attack
 - **Read-only** -- the tool never modifies system configuration, logs, or Cisco client settings
 - **Subprocess safety** -- all subprocess calls use list-form arguments (no `shell=True`); no shell injection vectors
