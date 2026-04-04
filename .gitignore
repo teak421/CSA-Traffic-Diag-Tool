@@ -1,0 +1,9 @@
+CLAUDE.md
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.ruff_cache/
+.python-version
+.claude/

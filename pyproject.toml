@@ -1,0 +1,25 @@
+[project]
+name = "csadiag"
+version = "1.0.0"
+description = "Cisco Secure Access traffic routing diagnostic tool for macOS and Windows"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+csa-traffic-diag = "csa_traffic_diag:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["csa_traffic_diag.py"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
