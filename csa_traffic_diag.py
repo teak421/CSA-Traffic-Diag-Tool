@@ -72,6 +72,28 @@ TUNNEL_IFACE_PATTERNS = ("utun", "cisco", "csc_", "anyconnect")
 # Strings in cert chain indicating Cisco interception (matched case-insensitively)
 CISCO_CERT_MARKERS = ("cisco", "umbrella", "opendns", "secure access")
 
+# Reverse-DNS substring → display name for hosting/CDN provider identification
+# More specific entries must come before less specific ones (first match wins)
+KNOWN_PROVIDERS = (
+    ("akamaiedge.net", "Akamai"),
+    ("akamaitechnologies.com", "Akamai"),
+    ("edgekey.net", "Akamai"),
+    ("cloudfront.net", "AWS CloudFront"),
+    ("amazonaws.com", "AWS"),
+    ("msedge.net", "Microsoft"),
+    ("azure", "Microsoft Azure"),
+    ("cloudflare", "Cloudflare"),
+    ("fastlylb.net", "Fastly"),
+    ("fastly.net", "Fastly"),
+    ("1e100.net", "Google"),
+    ("googleusercontent.com", "Google Cloud"),
+    ("llnwi.net", "Limelight"),
+    ("llnw.net", "Limelight"),
+    ("zscaler.net", "Zscaler"),
+    ("level3.net", "Lumen/Level3"),
+    ("cisco.com", "Cisco"),
+)
+
 # Regex for log scanning keywords
 LOG_PATTERNS = re.compile(
     r"\b(block(?:ed)?|deny|denied|drop(?:ped)?|refused|certificate"
@@ -109,6 +131,9 @@ DOMAIN_RE = re.compile(r"(?:https?://)?([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9]
 
 # Regex for extracting commonName from certificate subject/issuer strings
 _CN_RE = re.compile(r"commonName=([^,]+)")
+
+# Regex for extracting Organization from cert subject strings
+_ORG_RE = re.compile(r"organizationName=([^,]+)")
 
 # Platform detection
 IS_MACOS = platform.system() == "Darwin"
@@ -361,6 +386,52 @@ def _parse_cert_tuple_field(field_tuples):
     return ", ".join(parts)
 
 
+def _get_cert_org(tls_result):
+    """Extract organization name from a TLS result's leaf cert subject.
+
+    Returns None if the cert is Cisco-issued (decrypted traffic) or unavailable.
+    """
+    details = tls_result.get("details", {})
+    leaf_subject = details.get("leaf_subject", "")
+    if not leaf_subject:
+        return None
+    m = _ORG_RE.search(leaf_subject)
+    if not m:
+        return None
+    org = m.group(1).strip()
+    if any(marker in org.lower() for marker in CISCO_CERT_MARKERS):
+        return None
+    return org
+
+
+def _resolve_domain_info(domain):
+    """Resolve domain IPs and identify hosting provider via reverse DNS.
+
+    Returns dict with keys: ips, rdns (ip -> hostname), provider (name, rdns_host) or None.
+    Limits reverse DNS to 3 IPs to avoid excessive latency.
+    """
+    result = {"ips": [], "rdns": {}, "provider": None}
+    try:
+        addrs = socket.getaddrinfo(domain, None, socket.AF_INET)
+        ips = list(dict.fromkeys(addr[4][0] for addr in addrs))[:3]
+        result["ips"] = ips
+        for ip in ips:
+            try:
+                hostname = socket.gethostbyaddr(ip)[0]
+                result["rdns"][ip] = hostname
+                if result["provider"] is None:
+                    hl = hostname.lower()
+                    for substr, name in KNOWN_PROVIDERS:
+                        if substr in hl:
+                            result["provider"] = (name, hostname)
+                            break
+            except (socket.herror, socket.gaierror, OSError):
+                pass
+    except (socket.gaierror, OSError):
+        pass
+    return result
+
+
 def _parse_der_cert_with_openssl(der_bytes):
     """Parse subject and issuer from DER certificate bytes using openssl."""
     try:
@@ -400,6 +471,8 @@ def inspect_tls(domain, port=443):
     chain_entries = []
     method = "unknown"
     leaf_issuer = ""
+    leaf_subject = ""
+    sans = []
 
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -412,6 +485,7 @@ def inspect_tls(domain, port=443):
                 if leaf:
                     leaf_subject = _parse_cert_tuple_field(leaf.get("subject", ()))
                     leaf_issuer = _parse_cert_tuple_field(leaf.get("issuer", ()))
+                    sans = [v for k, v in leaf.get("subjectAltName", ()) if k == "DNS"]
                     chain_entries.append(
                         {
                             "subject": leaf_subject,
@@ -553,6 +627,8 @@ def inspect_tls(domain, port=443):
             "chain": chain_entries,
             "chain_display": chain_str,
             "leaf_issuer": leaf_issuer,
+            "leaf_subject": leaf_subject,
+            "sans": sans,
             "method": method,
         },
     )
@@ -2371,7 +2447,14 @@ def print_discover_results(discovery, color, verbose=False):
 
     # Recommendations (only in verify mode)
     if verified:
-        _print_recommendations(discovery, color)
+        actionable, related = _print_recommendations(discovery, color)
+        if actionable and sys.stdin.isatty():
+            try:
+                answer = input("\n  Research these domains before making changes? [y/N]: ").strip().lower()
+                if answer == "y":
+                    _research_domains(actionable, related, discovery, color)
+            except (EOFError, KeyboardInterrupt):
+                print()
 
 
 def _print_domain_group(base, info, color, verbose, tag=""):
@@ -2510,7 +2593,7 @@ def _print_recommendations(discovery, color):
     decrypted = discovery.get("decrypted", {})
 
     if not tls_errors:
-        return
+        return [], []
 
     # Separate actionable domains from likely noise
     actionable_domains = []
@@ -2558,6 +2641,131 @@ def _print_recommendations(discovery, color):
         for domain, reason in noise_domains:
             print(f"    {color.dim(domain)}")
             print(f"      {color.dim(reason)}")
+
+    if actionable_domains or related_decrypted:
+        warn = "Do not blindly add domains to the Do Not Decrypt or Traffic Steering lists."
+        print(f"\n  {color.bold(color.yellow('⚠️  ' + warn))}")
+        print(f"  {color.yellow('   Research each domain before adding to any exclusion list.')}")
+
+    return actionable_domains, related_decrypted
+
+
+def _research_domains(actionable, related, discovery, color):
+    """Research recommended domains — resolve IPs, identify owner, show SANs.
+
+    Groups domains by identified owner (cert org or hosting provider) so the
+    user can make an informed decision before adding to DND or TSB lists.
+    """
+    all_domains = list(actionable) + list(related)
+    if not all_domains:
+        return
+
+    tls_results = discovery.get("tls_results", {})
+
+    # Build domain → base mapping so we can look up TLS data per domain
+    domain_to_base = {}
+    for base, info in discovery.get("tls_errors", {}).items():
+        for d in info.get("domains", [base]):
+            domain_to_base[d] = base
+    for base, info in discovery.get("decrypted", {}).items():
+        for d in info.get("domains", [base]):
+            domain_to_base[d] = base
+
+    # Resolve each domain (show progress since DNS + rDNS can be slow)
+    domain_data = {}
+    for i, domain in enumerate(all_domains, 1):
+        print(f"  Researching {domain} ({i}/{len(all_domains)})...{' ' * 20}", end="\r", file=sys.stderr)
+        base = domain_to_base.get(domain)
+        tls_result = tls_results.get(base) if base else None
+        cert_org = _get_cert_org(tls_result) if tls_result else None
+        info = _resolve_domain_info(domain)
+        domain_data[domain] = {
+            "cert_org": cert_org,
+            "ips": info["ips"],
+            "rdns": info["rdns"],
+            "provider": info["provider"],
+        }
+    # Clear progress line
+    print(" " * 60, end="\r", file=sys.stderr)
+
+    # Collect SANs keyed by base domain (from TLS probe of representative)
+    base_sans = {}
+    for base, tls_result in tls_results.items():
+        sans = tls_result.get("details", {}).get("sans", [])
+        if sans:
+            base_sans[base] = sans
+
+    # Determine owner for each domain: cert org → hosting provider → Unidentified
+    domain_owner = {}  # domain -> (owner_name, id_method)
+    for domain in all_domains:
+        data = domain_data[domain]
+        if data.get("cert_org"):
+            domain_owner[domain] = (data["cert_org"], "Certificate")
+        elif data.get("provider"):
+            pname, _ = data["provider"]
+            domain_owner[domain] = (pname, "Hosting Provider")
+        else:
+            domain_owner[domain] = ("Unidentified", None)
+
+    # Group domains by owner name
+    groups = defaultdict(list)
+    for domain, (owner, _) in domain_owner.items():
+        groups[owner].append(domain)
+
+    print(f"\n{color.bold('[Domain Research]')}")
+
+    # Print identified groups first, Unidentified last
+    sorted_owners = sorted(groups.keys(), key=lambda o: (o == "Unidentified", o))
+    for owner in sorted_owners:
+        domains_in_group = groups[owner]
+        id_methods = {domain_owner[d][1] for d in domains_in_group if domain_owner[d][1]}
+        id_label = f" \u2014 identified via {', '.join(sorted(id_methods))}" if id_methods else ""
+        count = len(domains_in_group)
+        header = f"{owner} ({count} domain{'s' if count != 1 else ''}{id_label})"
+        print(f"\n  {color.bold(header)}")
+
+        # Cert org (if identified via cert, show the actual org string)
+        cert_orgs = sorted({domain_data[d]["cert_org"] for d in domains_in_group if domain_data[d].get("cert_org")})
+        if cert_orgs:
+            print(f"    Cert Org:  {', '.join(cert_orgs)}")
+
+        # Hosting providers seen across the group
+        seen_providers = {}
+        for d in domains_in_group:
+            p = domain_data[d].get("provider")
+            if p:
+                pname, phost = p
+                if pname not in seen_providers:
+                    seen_providers[pname] = phost
+        for pname, phost in sorted(seen_providers.items()):
+            print(f"    Hosting:   {color.dim(pname + ' (' + phost + ')')}")
+
+        # SANs — show for first domain in group that has them
+        for d in domains_in_group:
+            base = domain_to_base.get(d)
+            sans = base_sans.get(base, [])
+            if sans:
+                if len(sans) > 5:
+                    sans_str = ", ".join(sans[:5]) + f", +{len(sans) - 5} more"
+                else:
+                    sans_str = ", ".join(sans)
+                print(f"    SANs:      {color.dim(sans_str)}")
+                break
+
+        if owner == "Unidentified":
+            print(f"    {color.yellow('⚠️  Could not identify owner — research manually before adding')}")
+
+        print(f"    {color.dim('─' * 45)}")
+
+        for d in sorted(domains_in_group):
+            data = domain_data[d]
+            label = "(related — currently decrypted)" if d in related else ""
+            if data["ips"]:
+                ip_str = color.dim(", ".join(data["ips"]))
+            else:
+                ip_str = color.dim("(DNS resolution failed)")
+            suffix = f"  {color.dim(label)}" if label else ""
+            print(f"    {d:<50s} {ip_str}{suffix}")
 
 
 def _extract_service_root(domain):
