@@ -606,12 +606,28 @@ def run_traceroute(domain, max_hops=10):
 # ---------------------------------------------------------------------------
 
 
+def _unverified_ssl_ctx():
+    """Return an SSL context that skips certificate verification.
+
+    When Cisco Secure Access intercepts HTTPS traffic it presents its own CA
+    certificate.  Python's bundled CA store does not include that cert (it lives
+    in the macOS Keychain), so verified connections always fail.  For egress-IP
+    checks we only care about the response body, not the server's identity, so
+    skipping verification is safe here.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _fetch_egress_ip():
     """Get the public egress IP by querying external IP-echo services."""
+    ctx = _unverified_ssl_ctx()
     for url in EGRESS_IP_SERVICES:
         try:
             req = Request(url, headers={"User-Agent": "csa_traffic_diag"})
-            with urlopen(req, timeout=TIMEOUT) as resp:
+            with urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
                 ip = resp.read().decode("utf-8").strip()
                 # Basic validation: should look like an IP
                 if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
@@ -633,7 +649,7 @@ def _fetch_ipchicken_ip():
     """
     try:
         req = Request(IPCHICKEN_URL, headers={"User-Agent": "csa_traffic_diag"})
-        with urlopen(req, timeout=TIMEOUT) as resp:
+        with urlopen(req, timeout=TIMEOUT, context=_unverified_ssl_ctx()) as resp:
             html = resp.read().decode("utf-8", errors="replace")
         match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", html)
         if match:
