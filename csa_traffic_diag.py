@@ -10,6 +10,7 @@ import argparse
 import datetime
 import ipaddress
 import json
+import os
 import platform
 import re
 import socket
@@ -20,6 +21,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
 
 def _resolve_version():
     try:
@@ -649,6 +651,7 @@ def _fetch_ipchicken_ip():
     """
     try:
         req = Request(IPCHICKEN_URL, headers={"User-Agent": "csa_traffic_diag"})
+        # SSL context handles potential HTTP→HTTPS redirect by the proxy
         with urlopen(req, timeout=TIMEOUT, context=_unverified_ssl_ctx()) as resp:
             html = resp.read().decode("utf-8", errors="replace")
         match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", html)
@@ -719,16 +722,18 @@ def print_egress_comparison(color):
     print(f"  {color.bold('Egress IP Check:')}")
 
     if tunneled_ip:
-        print(f"    {'Tunneled (Cisco):':<{label_w}} {color.yellow(tunneled_ip)}"
-              f"  {color.dim('← not in traffic steering bypass')}")
+        print(
+            f"    {'Tunneled (Cisco):':<{label_w}} {color.yellow(tunneled_ip)}"
+            f"  {color.dim('← not in traffic steering bypass')}"
+        )
     else:
         print(f"    {'Tunneled (Cisco):':<{label_w}} {color.dim('unreachable')}")
 
     if bypass_ip:
-        if bypass_ip == tunneled_ip:
+        if bypass_ip == tunneled_ip or is_cisco_ip(bypass_ip):
             print(
                 f"    {'Bypass (ISP):':<{label_w}} {color.yellow(bypass_ip)}"
-                f"  {color.dim('← same as tunnel — ipchicken.com may not be on bypass list')}"
+                f"  {color.dim('← still Cisco — ipchicken.com not on bypass, or ZTA sync pending')}"
             )
         else:
             print(
@@ -740,6 +745,191 @@ def print_egress_comparison(color):
             f"    {'Bypass (ISP):':<{label_w}} {color.dim('unreachable')}  "
             f"{color.dim('← add ipchicken.com to traffic steering bypass list')}"
         )
+
+    print()
+
+
+# ---------------------------------------------------------------------------
+# macOS Keychain — Cisco CA certificate trust check
+# ---------------------------------------------------------------------------
+
+
+def _real_user_home_macos():
+    """Return the home directory of the invoking user, even when run via sudo.
+
+    Under ``sudo``, Path.home() resolves to /var/root and
+    security dump-trust-settings reads root's keychain — not the actual
+    user's.  SUDO_USER contains the original username when present.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        return Path(f"~{sudo_user}").expanduser()
+    return Path.home()
+
+
+def _is_cisco_ca_cert(name):
+    """Return True if *name* looks like a Cisco CA certificate.
+
+    Matches CISCO_CERT_MARKERS but excludes device-identity certs
+    (URN-style names like ``urn:cisco:sse:ztna:deviceid:…``) which are
+    not CA certs and do not need to be trusted.
+    """
+    lower = name.lower()
+    if lower.startswith("urn:"):
+        return False
+    return any(m in lower for m in CISCO_CERT_MARKERS)
+
+
+def _find_cisco_certs_macos():
+    """Search System and login keychains for Cisco CA certificates.
+
+    Returns a list of dicts with 'name' and 'hash' keys for every certificate
+    whose label matches a known Cisco marker.
+    """
+    real_home = _real_user_home_macos()
+    keychains = [
+        Path("/Library/Keychains/System.keychain"),
+        real_home / "Library/Keychains/login.keychain-db",
+        real_home / "Library/Keychains/login.keychain",
+    ]
+    found = []
+    seen_hashes = set()
+
+    for kc in keychains:
+        if not kc.exists():
+            continue
+        try:
+            result = subprocess.run(
+                ["security", "find-certificate", "-a", "-Z", str(kc)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            continue
+
+        current_hash = None
+        current_name = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("SHA-1 hash:"):
+                # Evaluate the previous cert before starting a new one
+                if current_hash and current_name and current_hash not in seen_hashes:
+                    if _is_cisco_ca_cert(current_name):
+                        found.append({"name": current_name, "hash": current_hash})
+                        seen_hashes.add(current_hash)
+                current_hash = line.split(":", 1)[1].strip()
+                current_name = None
+            elif '"labl"<blob>=' in line:
+                m = re.search(r'"labl"<blob>="([^"]+)"', line)
+                if m:
+                    current_name = m.group(1)
+
+        # Evaluate final cert in the output
+        if current_hash and current_name and current_hash not in seen_hashes:
+            if _is_cisco_ca_cert(current_name):
+                found.append({"name": current_name, "hash": current_hash})
+                seen_hashes.add(current_hash)
+
+    return found
+
+
+def _get_trusted_cert_names_macos():
+    """Return names of certs explicitly trusted in macOS trust settings.
+
+    Checks both user-level and admin-level trust domains.  A cert is
+    considered trusted when it appears in ``security dump-trust-settings``
+    with either:
+      - ``Number of trust settings : 0`` (Always Trust for all policies), or
+      - at least one per-policy entry with Result Type TrustRoot / TrustAsRoot.
+
+    Output format of ``security dump-trust-settings``::
+
+        Cert 0: Cisco Secure Access Root CA
+           Number of trust settings : 10
+           Trust Setting 0:
+              Policy OID            : SSL
+              Result Type           : kSecTrustSettingsResultTrustRoot
+        Cert 1: FortiClient DNS Root
+           Number of trust settings : 0
+    """
+    trusted = set()
+    trust_results = (
+        "kSecTrustSettingsResultTrustRoot",
+        "kSecTrustSettingsResultTrustAsRoot",
+    )
+
+    sudo_user = os.environ.get("SUDO_USER")
+    for flags in ([], ["-d"]):  # user domain, admin domain
+        try:
+            # User-domain trust settings must be read as the real user —
+            # running as root via sudo would query /var/root's keychain instead.
+            if flags == [] and sudo_user:
+                cmd = ["sudo", "-u", sudo_user, "security", "dump-trust-settings"]
+            else:
+                cmd = ["security", "dump-trust-settings"] + flags
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            continue
+
+        current_name = None
+        has_trust = False
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            # Match "Cert N: <cert name>"
+            m = re.match(r"^Cert \d+: (.+)$", line)
+            if m:
+                if current_name and has_trust:
+                    trusted.add(current_name.lower())
+                current_name = m.group(1)
+                has_trust = False
+            elif line.startswith("Number of trust settings : 0"):
+                # "Always Trust" for all policies — no per-policy entries follow
+                has_trust = True
+            elif any(t in line for t in trust_results):
+                has_trust = True
+
+        if current_name and has_trust:
+            trusted.add(current_name.lower())
+
+    return trusted
+
+
+def print_keychain_cert_check_macos(color):
+    """macOS only: print Cisco CA certificate installation and trust status.
+
+    Read-only — queries Keychain but never modifies it.  Alerts the user if
+    the Cisco CA cert is missing or present but not set to Always Trust.
+    """
+    cisco_certs = _find_cisco_certs_macos()
+    label = "Cisco CA Cert:"
+    label_w = 20
+
+    print(f"  {color.bold('Keychain Trust Check:')}")
+
+    if not cisco_certs:
+        print(
+            f"    {label:<{label_w}} {color.red('NOT FOUND')}"
+            f"  {color.dim('← install Cisco CA cert in Keychain and set to Always Trust')}"
+        )
+        print()
+        return
+
+    trusted_names = _get_trusted_cert_names_macos()
+    for cert in cisco_certs:
+        name = cert["name"]
+        if name.lower() in trusted_names:
+            print(f"    {label:<{label_w}} {color.green('TRUSTED')}  {color.dim(f'← {name}')}")
+        else:
+            print(
+                f"    {label:<{label_w}} {color.yellow('NOT TRUSTED')}"
+                f"  {color.dim(f'← {name} — Keychain Access → find cert → Get Info → Trust → Always Trust')}"
+            )
 
     print()
 
@@ -2509,9 +2699,15 @@ def main():
     color = ColorOutput(no_color=args.no_color or args.json)
     all_results = []
 
+    # Modes that involve network diagnosis benefit from the egress/cert header
+    needs_network_header = args.domain or args.full or args.discover
+
     if not args.json:
         print(color.banner())
-        print_egress_comparison(color)
+        if needs_network_header:
+            print_egress_comparison(color)
+            if IS_MACOS:
+                print_keychain_cert_check_macos(color)
 
     # Discover mode: scan, categorize, verify
     if args.discover:

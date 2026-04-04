@@ -200,6 +200,20 @@ If both IPs are the **same**, ipchicken.com is not yet on the bypass list (or yo
 
 If ipchicken.com is **unreachable**, the tool will prompt you to add it to the bypass list.
 
+### macOS: Cisco CA Certificate Trust Check
+
+On macOS, the tool automatically checks whether the Cisco CA certificates are installed **and** trusted in your Keychain. This is a common gotcha — the Cisco Secure Client installer places the certificates in the System Keychain, but they must be **manually set to "Always Trust"** before TLS interception will work correctly. Without this step, browsers and apps will reject Cisco's re-signed certificates with SSL errors.
+
+```
+  Keychain Trust Check:
+    Cisco CA Cert:       TRUSTED      ← Cisco Secure Access Root CA
+    Cisco CA Cert:       TRUSTED      ← Cisco Umbrella Root CA
+```
+
+If a certificate shows **NOT TRUSTED**, open **Keychain Access**, find the certificate, right-click **Get Info**, expand the **Trust** section, and set "When using this certificate" to **Always Trust**. You will be prompted for your admin password.
+
+> This check is **read-only** — the tool never modifies your Keychain or trust settings.
+
 ### Important: Bypass ≠ Do Not Decrypt
 
 > ⚠️ **The Do Not Decrypt list is not the same as Traffic Steering Bypass.**
