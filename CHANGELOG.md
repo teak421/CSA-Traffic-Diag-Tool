@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.3.1] - 2026-04-04
+## [1.4.0] - 2026-04-04
 
 ### Added
 - **DNS resolver visibility** — domain diagnosis now shows which DNS resolver answered: "Cisco Secure Access" when ZTA is tunneling, or the configured system resolver (with classification: Umbrella, Google, Cloudflare, local/private) when not tunneled.
@@ -10,9 +10,16 @@ All notable changes to this project will be documented in this file.
 - **TLS ALPN negotiation** — TLS probes now send `h2` and `http/1.1` ALPN protocols in the client hello, matching real browser behavior for better compatibility with modern servers.
 - **Graceful handling of non-standard TLS** �� servers that reject TLS probes with `ILLEGAL_PARAMETER` (ECH/proprietary TLS, e.g. Apple Private Relay) or `Connection reset by peer` (agent-only endpoints) now show a clean "not inspectable" note instead of a misleading "UNABLE TO DETERMINE" error. The route check (KDF verdict) serves as the authoritative signal.
 
+- **Loopback proxy detection** — route path check now recognizes `127.x.x.x → lo0` as Cisco's local SWG proxy, reporting "PROXIED" instead of the misleading "BYPASSED" verdict.
+- **ZTA state from flowlog.db** — when no ZTA text log exists, the status check falls back to querying the SQLite flow log database for recent activity to determine whether ZTA is actively connected.
+- **Friendly process names** in `--status` output: "VPN Agent", "Web Security (SWG)", "ISE Posture", "Network Extension" instead of internal process names.
+
 ### Changed
 - **Egress tunneled note** — replaced the bare "Netflix/streaming household detection WILL fail" text with a labeled, actionable note: "household IP verification (e.g. Netflix) may fail / Add affected domains to ZTA bypass profile if needed".
 - DNS display label changed from `DNS Resolution:` to `DNS (system):` when tunneled, paired with `DNS (Google):` reference line.
+- **Route path display** — only shown when TLS is inconclusive (ECH, connection reset, error). When TLS gives a clear proxied/not-proxied verdict, route path is suppressed to reduce noise.
+- **`--full` mode** — no longer includes client status output (use `--status` separately).
+- **Verdict spacing** — blank line added before every verdict line for cleaner readability.
 
 ## [1.3.0] - 2026-04-04
 

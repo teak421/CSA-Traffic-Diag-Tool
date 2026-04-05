@@ -1390,12 +1390,21 @@ def _check_route_macos(domain, target_ip):
         gateway = info.get("gateway")
         is_tunnel = _is_tunnel_interface(iface)
 
+        # Cisco ZTA's SWG module intercepts DNS and returns loopback IPs
+        # (127.x.x.x) to funnel traffic through its local proxy on lo0.
+        # Traffic to these IPs is NOT truly bypassed — it's being proxied.
+        is_loopback_proxy = target_ip.startswith("127.") and iface == "lo0"
+
         if is_tunnel:
             status = "warning"
             verdict = "TUNNELED"
             msg = (
                 f"Traffic to {domain} ({target_ip}) routes through tunnel interface {iface} — NOT bypassed at KDF level"
             )
+        elif is_loopback_proxy:
+            status = "warning"
+            verdict = "PROXIED"
+            msg = f"Traffic to {domain} ({target_ip}) routes to Cisco local proxy (lo0) — SWG intercept active"
         else:
             status = "ok"
             verdict = "DIRECT"
@@ -1411,6 +1420,7 @@ def _check_route_macos(domain, target_ip):
                 "interface": iface,
                 "gateway": gateway,
                 "is_tunnel": is_tunnel,
+                "is_loopback_proxy": is_loopback_proxy,
                 "verdict": verdict,
                 "raw": proc.stdout.strip(),
             },
@@ -1424,7 +1434,12 @@ def _check_route_macos(domain, target_ip):
 
 
 def _check_route_windows(domain, target_ip):
-    """Windows route path check using Find-NetRoute PowerShell cmdlet."""
+    """Windows route path check using Find-NetRoute PowerShell cmdlet.
+
+    Note: loopback proxy detection (127.x.x.x → lo0) is macOS-specific.
+    Windows ZTA/SWG may use a different interception mechanism — to be
+    investigated and added if the same pattern applies.
+    """
     try:
         ipaddress.ip_address(target_ip)
     except ValueError:
@@ -1589,7 +1604,7 @@ def _check_system_extension_macos():
                         "ok",
                         "acsockext: Loaded (activated enabled)",
                         {
-                            "extension": "acsockext",
+                            "extension": "Network Extension",
                             "loaded": True,
                             "detail": line.strip(),
                         },
@@ -1599,7 +1614,7 @@ def _check_system_extension_macos():
                     "warning",
                     f"acsockext: Found but state unclear — {line.strip()}",
                     {
-                        "extension": "acsockext",
+                        "extension": "Network Extension",
                         "loaded": False,
                         "detail": line.strip(),
                     },
@@ -1609,7 +1624,7 @@ def _check_system_extension_macos():
             "warning",
             "acsockext: Not found",
             {
-                "extension": "acsockext",
+                "extension": "Network Extension",
                 "loaded": False,
             },
         )
@@ -1619,7 +1634,7 @@ def _check_system_extension_macos():
             "warning",
             "systemextensionsctl not available",
             {
-                "extension": "acsockext",
+                "extension": "Network Extension",
             },
         )
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -1628,10 +1643,90 @@ def _check_system_extension_macos():
             "error",
             f"System extension check failed: {e}",
             {
-                "extension": "acsockext",
+                "extension": "Network Extension",
                 "error": str(e),
             },
         )
+
+
+def _check_zta_state_from_flowlog():
+    """Check ZTA state by looking for recent activity in flowlog.db.
+
+    Timestamps in the flow log use Unix epoch seconds (float).
+    """
+    import sqlite3
+
+    db_path = CSC_BASE / "zta" / "logs" / "flowlog.db"
+    if not db_path.exists():
+        return make_result(
+            "zta_state",
+            "info",
+            "ZTA log not found \u2014 cannot determine connection state",
+            {"checked_paths": [str(p) for p in ZTA_LOG_PATHS]},
+        )
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        cutoff = datetime.datetime.now() - datetime.timedelta(minutes=5)
+        cutoff_ts = cutoff.timestamp()
+
+        for table in tables:
+            if not _SAFE_SQL_IDENT.match(table):
+                continue
+            try:
+                cols = [desc[0] for desc in conn.execute(f'SELECT * FROM "{table}" LIMIT 1').description]
+                # Match timestamp columns using same broad pattern as _scan_zta_flowlog
+                ts_col = next(
+                    (c for c in cols if any(k in c.lower() for k in ("time", "date", "ts", "created", "stamp"))),
+                    None,
+                )
+                if not ts_col or not _SAFE_SQL_IDENT.match(ts_col):
+                    continue
+                row = conn.execute(
+                    f'SELECT "{ts_col}" FROM "{table}" WHERE "{ts_col}" > ? LIMIT 1',
+                    (cutoff_ts,),
+                ).fetchone()
+                if row:
+                    return make_result(
+                        "zta_state",
+                        "ok",
+                        "ZTA State: Active (recent flows in flowlog.db)",
+                        {"state": "active", "source": "flowlog.db"},
+                    )
+            except sqlite3.OperationalError:
+                continue
+        return make_result(
+            "zta_state",
+            "info",
+            "ZTA State: No recent activity (flowlog.db has no flows in last 5 min)",
+            {"state": "inactive", "source": "flowlog.db"},
+        )
+    except sqlite3.OperationalError as e:
+        if "unable to open" in str(e).lower():
+            return make_result(
+                "zta_state",
+                "warning",
+                "ZTA flowlog.db requires elevated permissions (try sudo)",
+                {"state": "unknown", "source": "flowlog.db"},
+            )
+        return make_result(
+            "zta_state",
+            "info",
+            f"ZTA flowlog.db unreadable: {e}",
+            {"state": "unknown", "source": "flowlog.db"},
+        )
+    except (sqlite3.Error, OSError, ValueError) as e:
+        return make_result(
+            "zta_state",
+            "info",
+            f"ZTA state check failed: {e}",
+            {"state": "unknown"},
+        )
+    finally:
+        if conn:
+            conn.close()
 
 
 def _check_zta_state_macos():
@@ -1653,14 +1748,9 @@ def _check_zta_state_macos():
             if zta_log:
                 break
     if zta_log is None:
-        return make_result(
-            "zta_state",
-            "info",
-            "ZTA log not found — cannot determine connection state",
-            {
-                "checked_paths": [str(p) for p in ZTA_LOG_PATHS],
-            },
-        )
+        # No text log found — fall back to checking flowlog.db for recent activity.
+        # If there are recent rows, ZTA is actively logging flows (i.e. connected).
+        return _check_zta_state_from_flowlog()
 
     try:
         with open(zta_log, errors="replace") as f:
@@ -1722,9 +1812,9 @@ def check_status_macos():
 
     # Process checks
     processes = [
-        ("csc_vpnagentd", "vpnagentd"),
-        ("csc_swgagent", "csc_swgagent"),
-        ("aciseposture", "aciseposture"),
+        ("VPN Agent", "vpnagentd"),
+        ("Web Security (SWG)", "csc_swgagent"),
+        ("ISE Posture", "aciseposture"),
     ]
     for name, pattern in processes:
         results.append(_check_process_macos(name, pattern))
@@ -1837,9 +1927,9 @@ def check_status_windows():
     results = []
 
     processes = [
-        ("vpnagent", "vpnagent.exe"),
-        ("csc_swgagent", "csc_swgagent.exe"),
-        ("aciseagent", "aciseagent.exe"),
+        ("VPN Agent", "vpnagent.exe"),
+        ("Web Security (SWG)", "csc_swgagent.exe"),
+        ("ISE Posture", "aciseagent.exe"),
     ]
     for name, exe in processes:
         results.append(_check_process_windows(name, exe))
@@ -2304,14 +2394,13 @@ def scan_logs(minutes=60, domain_filter=None):
 
 
 def run_full_diagnosis(domain, minutes=60, trace=False):
-    """Run domain diagnosis + log scan + client status."""
+    """Run domain diagnosis + log scan (no client status — use --status for that)."""
     results = []
     results.extend(diagnose_domain(domain, trace=trace))
     # Scan logs for each domain separately
     domains = [d.strip() for d in domain.split(",") if d.strip()]
     for d in domains:
         results.append(scan_logs(minutes, domain_filter=d))
-    results.extend(check_status())
     return results
 
 
@@ -2345,18 +2434,22 @@ def print_domain_results(results, color):
         rdns_str = f" ({rdns})" if rdns else ""
         if ip == "unknown":
             print(f"  Public IP:       {color.yellow('UNKNOWN')} \u2014 could not reach IP-echo services")
+            print()
             print(f"  {icon} Verdict:       {color.yellow('UNABLE TO DETERMINE')} \u2014 run: curl -s ifconfig.me")
         elif details.get("is_cisco"):
             print(f"  Public IP:       {ip}{rdns_str}")
+            print()
             print(f"  {icon} Verdict:       {color.red('TUNNELED')} \u2014 traffic exits through Cisco Secure Access")
             print(f"  {color.yellow('Note:')}           household IP verification (e.g. Netflix) may fail")
             print(f"                   {color.dim('Add affected domains to ZTA bypass profile if needed')}")
         else:
             print(f"  Public IP:       {ip}{rdns_str}")
+            print()
             print(f"  {icon} Verdict:       {color.green('DIRECT')} \u2014 traffic exits through local ISP")
 
     for domain, checks in domain_results.items():
         print(f"\n{color.bold(f'[Domain Check: {domain}]')}")
+        tls_conclusive = False  # Track whether TLS gave a clear answer
         for r in checks:
             check = r["check"]
             details = r.get("details", {})
@@ -2391,25 +2484,32 @@ def print_domain_results(results, color):
             elif check == "tls":
                 if r["status"] == "error":
                     print(f"  TLS Check:       {color.red(r['message'])}")
+                    print()
                     print(f"  {icon} Verdict:       {color.yellow('UNABLE TO DETERMINE')}")
                 elif details.get("method") == "none":
                     # Server rejected TLS probe — use chain_display which has context-specific text
                     print(f"  TLS Check:       {color.dim(details.get('chain_display', 'not inspectable'))}")
                 else:
+                    tls_conclusive = True
                     chain_str = details.get("chain_display", "(unknown)")
                     print(f"  TLS Chain:       {chain_str}")
 
                     if details.get("is_proxied"):
                         print(f"  Cisco SubCA:     {color.yellow('FOUND')} \u26a0\ufe0f")
+                        print()
                         print(
                             f"  {icon} Verdict:       {color.red(details.get('verdict', 'PROXIED / DECRYPTED'))}"
                             f" \u2014 add to Traffic Steering Bypass"
                         )
                     else:
                         print(f"  Cisco SubCA:     {color.green('NOT FOUND')}")
+                        print()
                         print(f"  {icon} Verdict:       {color.green(details.get('verdict', 'DIRECT / BYPASSED'))}")
 
             elif check == "route_path":
+                # Only show route path when TLS didn't give a clear answer
+                if tls_conclusive:
+                    continue
                 iface = details.get("interface", "unknown")
                 target_ip = details.get("target_ip", "")
                 is_tunnel = details.get("is_tunnel", False)
@@ -2417,10 +2517,13 @@ def print_domain_results(results, color):
 
                 gw_str = f" via {gateway}" if gateway else ""
                 print(f"  Route Path:      {target_ip} \u2192 {iface}{gw_str}")
-                if is_tunnel:
-                    print(f"  {icon} KDF Verdict:   {color.red('TUNNELED')} — TSB not active for this domain")
+                print()
+                if details.get("is_loopback_proxy"):
+                    print(f"  {icon} KDF Verdict:   {color.red('PROXIED')} \u2014 Cisco local SWG proxy (lo0)")
+                elif is_tunnel:
+                    print(f"  {icon} KDF Verdict:   {color.red('TUNNELED')} \u2014 TSB not active for this domain")
                 else:
-                    print(f"  {icon} KDF Verdict:   {color.green('BYPASSED')} — traffic routes locally")
+                    print(f"  {icon} KDF Verdict:   {color.green('BYPASSED')} \u2014 traffic routes locally")
 
             elif check == "traceroute":
                 hops = details.get("hops", [])
@@ -3235,7 +3338,7 @@ def build_parser():
         "--scan-logs", action="store_true", help="Scan Cisco Secure Client logs for block/error events (raw output)"
     )
     parser.add_argument("--status", action="store_true", help="Check Secure Client component status")
-    parser.add_argument("--full", metavar="DOMAIN", help="Run full diagnosis (domain + logs + status)")
+    parser.add_argument("--full", metavar="DOMAIN", help="Run full diagnosis (domain + logs)")
     parser.add_argument("--minutes", type=int, default=60, help="Log scan lookback in minutes (default: 60)")
     parser.add_argument(
         "-v",
