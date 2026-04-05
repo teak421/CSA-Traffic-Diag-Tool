@@ -475,6 +475,7 @@ def _resolve_via_public_dns(domain):
     """
     # Build an unverified context as fallback for Cisco-intercepted HTTPS
     noverify = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    noverify.minimum_version = ssl.TLSVersion.TLSv1_2
     noverify.check_hostname = False
     noverify.verify_mode = ssl.CERT_NONE
 
@@ -723,6 +724,7 @@ def inspect_tls(domain, port=443):
 
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_default_certs()
         ctx.set_alpn_protocols(["h2", "http/1.1"])
 
@@ -770,6 +772,7 @@ def inspect_tls(domain, port=443):
         # Try without verification to still inspect the chain
         try:
             ctx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx2.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx2.check_hostname = False
             ctx2.verify_mode = ssl.CERT_NONE
             ctx2.set_alpn_protocols(["h2", "http/1.1"])
