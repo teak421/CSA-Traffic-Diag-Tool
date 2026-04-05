@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - **Route path display** — only shown when TLS is inconclusive (ECH, connection reset, error). When TLS gives a clear proxied/not-proxied verdict, route path is suppressed to reduce noise.
 - **`--full` mode** — no longer includes client status output (use `--status` separately).
 - **Verdict spacing** — blank line added before every verdict line for cleaner readability.
+- **Exclusion list disclaimer** — "Do not blindly add domains to exclusion lists" warning now appears on all output modes except `--status`.
 
 ## [1.3.0] - 2026-04-04
 

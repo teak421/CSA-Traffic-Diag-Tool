@@ -2593,11 +2593,17 @@ def print_status_results(results, color):
             print(f"  {icon} {r['message']}")
 
 
-def print_verdict_box(all_results, color):
+def print_verdict_box(all_results, color, show_disclaimer=True):
     """Print summary verdict box."""
     statuses = [r.get("status") for r in all_results]
     has_error = "error" in statuses
     has_warning = "warning" in statuses
+
+    if show_disclaimer:
+        print()
+        warn = "Do not blindly add domains to exclusion lists."
+        print(f"  {color.yellow('\u26a0\ufe0f  ' + warn)}")
+        print(f"  {color.dim('   Research each domain before adding to Do Not Decrypt or Traffic Steering Bypass.')}")
 
     line = "\u2500" * 55
     print(f"\n{color.bold(line)}")
@@ -3454,7 +3460,8 @@ def main():
     if args.json:
         print(format_json(all_results))
     else:
-        print_verdict_box(all_results, color)
+        status_only = args.status and not args.domain and not args.scan_logs
+        print_verdict_box(all_results, color, show_disclaimer=not status_only)
 
     # Exit code
     statuses = [r.get("status") for r in all_results]
