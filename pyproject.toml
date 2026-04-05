@@ -1,6 +1,6 @@
 [project]
 name = "csadiag"
-version = "1.3.0"
+version = "1.3.1"
 description = "Cisco Secure Access traffic routing diagnostic tool for macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.13"

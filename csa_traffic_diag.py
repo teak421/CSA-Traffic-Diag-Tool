@@ -367,7 +367,137 @@ def is_cisco_ip(ip):
     return any(ip.startswith(prefix) for prefix in CISCO_IP_PREFIXES)
 
 
-def diagnose_dns(domain):
+# Well-known DNS server IPs → human-friendly label
+_KNOWN_DNS_SERVERS = {
+    "208.67.222.222": "Umbrella (Cisco)",
+    "208.67.220.220": "Umbrella (Cisco)",
+    "208.67.222.123": "Umbrella (Cisco)",
+    "208.67.220.123": "Umbrella (Cisco)",
+    "127.0.0.1": "localhost proxy",
+    "::1": "localhost proxy",
+    "8.8.8.8": "Google",
+    "8.8.4.4": "Google",
+    "1.1.1.1": "Cloudflare",
+    "1.0.0.1": "Cloudflare",
+}
+
+
+def _classify_dns_server(ip):
+    """Return a human-friendly label for a DNS server IP, or None."""
+    if ip in _KNOWN_DNS_SERVERS:
+        return _KNOWN_DNS_SERVERS[ip]
+    if is_cisco_ip(ip):
+        return "Cisco"
+    # Private/local ranges
+    if ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172."):
+        # Check 172.16-31.x.x
+        if ip.startswith("172."):
+            parts = ip.split(".")
+            try:
+                if len(parts) >= 2 and 16 <= int(parts[1]) <= 31:
+                    return "local/private"
+            except ValueError:
+                pass
+        else:
+            return "local/private"
+    return None
+
+
+def _get_system_dns_servers():
+    """Return the system's configured DNS nameserver IPs.
+
+    macOS: parses ``scutil --dns`` (resolver #1).
+    Windows: uses PowerShell Get-DnsClientServerAddress.
+    Returns an empty list on failure.
+    """
+    try:
+        if IS_MACOS:
+            proc = subprocess.run(
+                ["scutil", "--dns"],
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT,
+            )
+            if proc.returncode != 0:
+                return []
+            # Extract nameservers from the first resolver block only
+            servers = []
+            in_resolver_1 = False
+            for line in proc.stdout.splitlines():
+                if line.startswith("resolver #1"):
+                    in_resolver_1 = True
+                    continue
+                if in_resolver_1 and line.startswith("resolver #"):
+                    break  # past resolver #1
+                if in_resolver_1 and "nameserver" in line:
+                    # e.g. "  nameserver[0] : 192.168.1.1"
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        ip = parts[-1].strip()
+                        if ip:
+                            servers.append(ip)
+            return servers
+        elif IS_WINDOWS:
+            proc = subprocess.run(
+                [
+                    "powershell",
+                    "-Command",
+                    "Get-DnsClientServerAddress -AddressFamily IPv4"
+                    " | Select-Object -ExpandProperty ServerAddresses"
+                    " | Select-Object -Unique -First 4",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT,
+            )
+            if proc.returncode != 0:
+                return []
+            return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return []
+
+
+def _resolve_via_public_dns(domain):
+    """Resolve *domain* via DNS-over-HTTPS (DoH).
+
+    Uses HTTPS to bypass ZTA's DNS-level interception — ZTA intercepts all
+    standard DNS traffic (including direct queries to 8.8.8.8), but DoH goes
+    over port 443 as regular HTTPS and is not intercepted at the DNS layer.
+
+    When Cisco's TLS proxy intercepts the DoH request and re-signs with a cert
+    that fails Python's strict validation (e.g. missing Authority Key Identifier),
+    we fall back to an unverified SSL context.  This is safe — we're only reading
+    public DNS records, not sending sensitive data.
+
+    Tries Google DoH first, then Cloudflare as fallback.
+    Returns a sorted list of IPv4 addresses, or ``None`` on failure.
+    """
+    # Build an unverified context as fallback for Cisco-intercepted HTTPS
+    noverify = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    noverify.check_hostname = False
+    noverify.verify_mode = ssl.CERT_NONE
+
+    doh_endpoints = [
+        ("https://dns.google/resolve", "Google"),
+        ("https://cloudflare-dns.com/dns-query", "Cloudflare"),
+    ]
+    for base_url, _provider in doh_endpoints:
+        url = f"{base_url}?name={domain}&type=A"
+        req = Request(url, headers={"Accept": "application/dns-json"})
+        # Try verified first, then unverified fallback
+        for ctx in (None, noverify):
+            try:
+                resp = urlopen(req, timeout=TIMEOUT, context=ctx)
+                data = json.loads(resp.read())
+                ips = sorted(ans["data"] for ans in data.get("Answer", []) if ans.get("type") == 1)
+                return ips if ips else None
+            except (URLError, OSError, ValueError, KeyError):
+                continue
+    return None
+
+
+def diagnose_dns(domain, is_tunneled=False):
     """Resolve a domain and check if IPs belong to Cisco/OpenDNS ranges."""
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(TIMEOUT)
@@ -379,6 +509,35 @@ def diagnose_dns(domain):
         msg = f"Resolved to {', '.join(ips)}"
         if cisco_ips:
             msg += f" — Cisco/OpenDNS IP detected: {', '.join(cisco_ips)}"
+
+        # Determine the effective DNS resolver label
+        if is_tunneled:
+            # ZTA intercepts DNS transparently at the network extension level —
+            # scutil --dns still shows the local router, but queries actually go
+            # through Cisco Secure Access.
+            dns_resolver_label = "Cisco Secure Access"
+        else:
+            dns_servers_raw = _get_system_dns_servers()
+            if dns_servers_raw:
+                first = dns_servers_raw[0]
+                label = _classify_dns_server(first)
+                dns_resolver_label = f"{first} \u2014 {label}" if label else first
+            else:
+                dns_resolver_label = None
+
+        # Compare system DNS against Google DoH to detect stale cache.
+        # Only run when tunneled — non-tunneled users hit their ISP resolver
+        # directly so DoH comparison adds no value and costs ~1-2s latency.
+        public_ips = None
+        dns_mismatch = False
+        if is_tunneled:
+            public_ips = _resolve_via_public_dns(domain)
+            system_ipv4 = sorted(ip for ip in ips if ":" not in ip)
+            dns_mismatch = public_ips is not None and system_ipv4 != public_ips
+            if dns_mismatch and status == "ok":
+                status = "warning"
+                msg += " — DNS mismatch with Google DoH"
+
         return make_result(
             "dns",
             status,
@@ -388,6 +547,10 @@ def diagnose_dns(domain):
                 "ips": ips,
                 "cisco_ips": cisco_ips,
                 "is_cisco_dns": bool(cisco_ips),
+                "resolver_label": dns_resolver_label,
+                "is_tunneled": is_tunneled,
+                "public_dns_ips": public_ips,
+                "dns_mismatch": dns_mismatch,
             },
         )
     except socket.gaierror as e:
@@ -561,6 +724,7 @@ def inspect_tls(domain, port=443):
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_default_certs()
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
 
         with socket.create_connection((domain, port), timeout=TIMEOUT) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
@@ -608,6 +772,7 @@ def inspect_tls(domain, port=443):
             ctx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx2.check_hostname = False
             ctx2.verify_mode = ssl.CERT_NONE
+            ctx2.set_alpn_protocols(["h2", "http/1.1"])
             with socket.create_connection((domain, port), timeout=TIMEOUT) as sock:
                 with ctx2.wrap_socket(sock, server_hostname=domain) as ssock:
                     der = ssock.getpeercert(binary_form=True)
@@ -653,6 +818,29 @@ def inspect_tls(domain, port=443):
             },
         )
     except ssl.SSLError as e:
+        if "ILLEGAL_PARAMETER" in str(e):
+            # Server rejected our TLS client hello — this indicates the server requires
+            # ECH (Encrypted Client Hello) or a proprietary TLS client (e.g. Apple Private Relay).
+            # Crucially: if Cisco were intercepting, we'd be talking to Cisco's TLS proxy
+            # and would never see the real server's rejection. Receiving this alert means
+            # traffic reached the origin server directly — not proxied by Cisco.
+            return make_result(
+                "tls",
+                "warning",
+                "TLS probe rejected by server (requires ECH or proprietary TLS client)",
+                {
+                    "domain": domain,
+                    "verdict": "NOT PROXIED — server rejects all TLS probes (ECH/proprietary)",
+                    "is_proxied": False,
+                    "matching_cert": None,
+                    "chain": [],
+                    "chain_display": "— server requires ECH / proprietary TLS (not inspectable)",
+                    "leaf_issuer": "",
+                    "leaf_subject": "",
+                    "sans": [],
+                    "method": "none",
+                },
+            )
         return make_result(
             "tls",
             "error",
@@ -664,6 +852,27 @@ def inspect_tls(domain, port=443):
             },
         )
     except OSError as e:
+        if e.errno in (54, 104):  # Connection reset by peer (macOS=54, Linux=104)
+            # Server actively reset the TCP connection — it reached the real server
+            # but the server rejected us (e.g. requires agent client cert, IP allowlist).
+            # If Cisco were intercepting, we'd talk to Cisco's proxy, not the real server.
+            return make_result(
+                "tls",
+                "warning",
+                "TLS probe rejected — server reset connection (may require agent/client cert)",
+                {
+                    "domain": domain,
+                    "verdict": "NOT PROXIED — server rejected connection directly",
+                    "is_proxied": False,
+                    "matching_cert": None,
+                    "chain": [],
+                    "chain_display": "— server reset connection (not inspectable)",
+                    "leaf_issuer": "",
+                    "leaf_subject": "",
+                    "sans": [],
+                    "method": "none",
+                },
+            )
         return make_result(
             "tls",
             "error",
@@ -899,29 +1108,17 @@ def print_egress_comparison(color):
     print(f"  {color.bold('Egress IP Check:')}")
 
     if tunneled_ip:
-        print(
-            f"    {'Tunneled (Cisco):':<{label_w}} {color.yellow(tunneled_ip)}"
-            f"  {color.dim('← ' + tunneled_hint)}"
-        )
+        print(f"    {'Tunneled (Cisco):':<{label_w}} {color.yellow(tunneled_ip)}  {color.dim('← ' + tunneled_hint)}")
     else:
         print(f"    {'Tunneled (Cisco):':<{label_w}} {color.dim('unreachable')}")
 
     if bypass_ip:
         if bypass_ip == tunneled_ip or is_cisco_ip(bypass_ip):
-            print(
-                f"    {'Bypass (ISP):':<{label_w}} {color.yellow(bypass_ip)}"
-                f"  {color.dim('← ' + bypass_fail_hint)}"
-            )
+            print(f"    {'Bypass (ISP):':<{label_w}} {color.yellow(bypass_ip)}  {color.dim('← ' + bypass_fail_hint)}")
         else:
-            print(
-                f"    {'Bypass (ISP):':<{label_w}} {color.green(bypass_ip)}"
-                f"  {color.dim('← ' + bypass_ok_hint)}"
-            )
+            print(f"    {'Bypass (ISP):':<{label_w}} {color.green(bypass_ip)}  {color.dim('← ' + bypass_ok_hint)}")
     else:
-        print(
-            f"    {'Bypass (ISP):':<{label_w}} {color.dim('unreachable')}  "
-            f"{color.dim('← ' + bypass_add_hint)}"
-        )
+        print(f"    {'Bypass (ISP):':<{label_w}} {color.dim('unreachable')}  {color.dim('← ' + bypass_add_hint)}")
 
     print()
 
@@ -1302,10 +1499,12 @@ def diagnose_domain(domains_str, trace=False):
     all_results = []
 
     # Global egress IP check (once, not per-domain)
-    all_results.append(check_egress_ip())
+    egress_result = check_egress_ip()
+    all_results.append(egress_result)
+    is_tunneled = egress_result.get("details", {}).get("is_cisco", False)
 
     for domain in domains:
-        dns_result = diagnose_dns(domain)
+        dns_result = diagnose_dns(domain, is_tunneled=is_tunneled)
         all_results.append(dns_result)
 
         tls_result = inspect_tls(domain)
@@ -2150,7 +2349,8 @@ def print_domain_results(results, color):
         elif details.get("is_cisco"):
             print(f"  Public IP:       {ip}{rdns_str}")
             print(f"  {icon} Verdict:       {color.red('TUNNELED')} \u2014 traffic exits through Cisco Secure Access")
-            print("                   Netflix/streaming household detection WILL fail")
+            print(f"  {color.yellow('Note:')}           household IP verification (e.g. Netflix) may fail")
+            print(f"                   {color.dim('Add affected domains to ZTA bypass profile if needed')}")
         else:
             print(f"  Public IP:       {ip}{rdns_str}")
             print(f"  {icon} Verdict:       {color.green('DIRECT')} \u2014 traffic exits through local ISP")
@@ -2168,12 +2368,33 @@ def print_domain_results(results, color):
                 cisco_flag = ""
                 if details.get("is_cisco_dns"):
                     cisco_flag = color.yellow(" (Cisco/OpenDNS IP!)")
-                print(f"  DNS Resolution:  {ip_str}{cisco_flag}")
+
+                # Show resolver label
+                resolver_label = details.get("resolver_label")
+                resolver_str = color.dim(f"  (via {resolver_label})") if resolver_label else ""
+
+                print(f"  DNS (system):    {ip_str}{cisco_flag}{resolver_str}")
+
+                # Show Google DoH reference when tunneled
+                public_ips = details.get("public_dns_ips")
+                if public_ips is not None:
+                    public_str = ", ".join(public_ips)
+                    if details.get("dns_mismatch"):
+                        print(f"  DNS (Google):    {color.yellow(public_str)}  {color.yellow('⚠ MISMATCH')}")
+                        print(f"                   {color.dim('Possible stale cache in Cisco DNS path')}")
+                    elif details.get("is_tunneled"):
+                        print(f"  DNS (Google):    {public_str}  {color.dim('✓ match')}")
+                elif details.get("is_tunneled"):
+                    hint = "unavailable \u2014 add dns.google to Traffic Steering Bypass"
+                    print(f"  DNS (Google):    {color.dim(hint)}")
 
             elif check == "tls":
                 if r["status"] == "error":
                     print(f"  TLS Check:       {color.red(r['message'])}")
                     print(f"  {icon} Verdict:       {color.yellow('UNABLE TO DETERMINE')}")
+                elif details.get("method") == "none":
+                    # Server rejected TLS probe — use chain_display which has context-specific text
+                    print(f"  TLS Check:       {color.dim(details.get('chain_display', 'not inspectable'))}")
                 else:
                     chain_str = details.get("chain_display", "(unknown)")
                     print(f"  TLS Chain:       {chain_str}")
@@ -2353,13 +2574,37 @@ _PROCESS_ID_PREFIXES = (
 # Only includes extensions that are NOT real gTLDs or ccTLDs — excludes .app
 # (gTLD), .py (Paraguay), .js (Jersey), .sh (Saint Helena), .so (Somalia),
 # .rs (Serbia), .mm (Myanmar) to avoid filtering real domains.
-_FILE_EXTENSIONS = frozenset({
-    "cpp", "h", "c", "swift", "java", "class", "jar",
-    "ts", "rb", "go",
-    "dylib", "dll", "exe", "sys", "ko",
-    "plist", "log", "conf", "cfg", "ini", "json", "xml", "yaml", "yml",
-    "bat", "cmd", "ps1",
-})
+_FILE_EXTENSIONS = frozenset(
+    {
+        "cpp",
+        "h",
+        "c",
+        "swift",
+        "java",
+        "class",
+        "jar",
+        "ts",
+        "rb",
+        "go",
+        "dylib",
+        "dll",
+        "exe",
+        "sys",
+        "ko",
+        "plist",
+        "log",
+        "conf",
+        "cfg",
+        "ini",
+        "json",
+        "xml",
+        "yaml",
+        "yml",
+        "bat",
+        "cmd",
+        "ps1",
+    }
+)
 
 
 def _is_process_identifier(name):

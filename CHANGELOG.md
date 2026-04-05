@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2026-04-04
+
+### Added
+- **DNS resolver visibility** — domain diagnosis now shows which DNS resolver answered: "Cisco Secure Access" when ZTA is tunneling, or the configured system resolver (with classification: Umbrella, Google, Cloudflare, local/private) when not tunneled.
+- **Google DoH comparison** — when tunneled, the tool queries Google DNS-over-HTTPS (`dns.google`) as an independent reference and displays both results side by side. Mismatches are flagged with a warning to help catch stale DNS cache issues in Cisco's DNS path. Requires `dns.google` on the Traffic Steering Bypass list.
+- **TLS ALPN negotiation** — TLS probes now send `h2` and `http/1.1` ALPN protocols in the client hello, matching real browser behavior for better compatibility with modern servers.
+- **Graceful handling of non-standard TLS** �� servers that reject TLS probes with `ILLEGAL_PARAMETER` (ECH/proprietary TLS, e.g. Apple Private Relay) or `Connection reset by peer` (agent-only endpoints) now show a clean "not inspectable" note instead of a misleading "UNABLE TO DETERMINE" error. The route check (KDF verdict) serves as the authoritative signal.
+
+### Changed
+- **Egress tunneled note** — replaced the bare "Netflix/streaming household detection WILL fail" text with a labeled, actionable note: "household IP verification (e.g. Netflix) may fail / Add affected domains to ZTA bypass profile if needed".
+- DNS display label changed from `DNS Resolution:` to `DNS (system):` when tunneled, paired with `DNS (Google):` reference line.
+
 ## [1.3.0] - 2026-04-04
 
 ### Added

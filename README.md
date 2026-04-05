@@ -135,7 +135,7 @@ csa-traffic-diag -d netflix.com -t
 ```
 
 **What it checks:**
-1. **DNS resolution** -- resolves the domain and flags Cisco/OpenDNS IP ranges (146.112.x.x, 155.190.x.x, etc.)
+1. **DNS resolution** -- resolves the domain, flags Cisco/OpenDNS IP ranges, and identifies the DNS resolver (Cisco Secure Access when tunneled, or local resolver). When tunneled, compares against Google DNS-over-HTTPS to detect stale cache mismatches
 2. **TLS certificate chain** -- connects on port 443, retrieves the full cert chain, checks for Cisco SubCA certificates
 3. **Egress IP** -- queries external IP-echo services to determine if traffic exits through Cisco's cloud or your local ISP
 4. **Route path** -- checks the OS routing table to see if the domain's IP routes through a tunnel interface (macOS: `route get`, Windows: `Find-NetRoute`)
@@ -268,6 +268,10 @@ If a Cisco SubCA is found, traffic is being **proxied and decrypted**. If the re
 ### DNS Redirection Detection
 
 Cisco Umbrella's DNS-layer protection redirects queries to Cisco IP ranges. The tool flags resolved IPs in known Cisco/OpenDNS prefixes: `146.112.x.x`, `155.190.x.x`, `151.186.x.x`, `163.129.x.x`.
+
+When ZTA is tunneling traffic, the tool labels DNS results as "(via Cisco Secure Access)" and queries Google DNS-over-HTTPS (`dns.google`) as an independent comparison. If the results differ, a mismatch warning is shown to help identify stale DNS cache issues.
+
+> **Tip:** Add `dns.google` to your Traffic Steering Bypass list to enable the DNS comparison feature. Without it, ZTA intercepts the DoH request and the comparison is unavailable.
 
 ### Log Scanning
 
@@ -412,7 +416,8 @@ This repository has the following GitHub security features enabled:
 - **Read-only** -- the tool never modifies system configuration, logs, or Cisco client settings
 - **Subprocess safety** -- all subprocess calls use list-form arguments (no `shell=True`); no shell injection vectors
 - **SQLite access** -- flow log databases are opened in read-only mode (`?mode=ro`)
-- **Egress IP check** -- queries public IP-echo services (ifconfig.me, api.ipify.org, icanhazip.com, checkip.amazonaws.com) to determine your outbound IP. These are HTTPS requests. No other data is sent externally
+- **Egress IP check** -- queries public IP-echo services (ifconfig.me, api.ipify.org, icanhazip.com, checkip.amazonaws.com) to determine your outbound IP. These are HTTPS requests
+- **DNS-over-HTTPS** -- when ZTA is tunneling, queries `dns.google` and/or `cloudflare-dns.com` for DNS comparison. Only the domain name being diagnosed is sent. No other data is sent externally
 - **Log content** -- output may include hostnames, IP addresses, and log snippets from your system. Review before sharing diagnostics externally
 
 ## License
