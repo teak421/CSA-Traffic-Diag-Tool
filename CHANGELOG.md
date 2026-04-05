@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.1] - 2026-04-04
+
+### Fixed
+- **CodeQL security alerts** — all SSL contexts now enforce TLS 1.2 minimum (`minimum_version = TLSv1_2`), preventing negotiation of deprecated TLS 1.0/1.1. Resolves GitHub CodeQL alerts #1 and #2 (`py/insecure-protocol`).
+
 ## [1.4.0] - 2026-04-04
 
 ### Added
