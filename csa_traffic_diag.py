@@ -542,15 +542,20 @@ def diagnose_dns(domain, is_tunneled=False):
         # Compare system DNS against Google DoH to detect stale cache.
         # Only run when tunneled — non-tunneled users hit their ISP resolver
         # directly so DoH comparison adds no value and costs ~1-2s latency.
+        # Skip mismatch when system returns loopback IPs (127.x.x.x) — Cisco's
+        # SWG proxy always returns loopback addresses for proxied/DND traffic,
+        # so a mismatch with public DNS is expected, not a stale cache issue.
         public_ips = None
         dns_mismatch = False
         if is_tunneled:
-            public_ips = _resolve_via_public_dns(domain)
             system_ipv4 = sorted(ip for ip in ips if ":" not in ip)
-            dns_mismatch = public_ips is not None and system_ipv4 != public_ips
-            if dns_mismatch and status == "ok":
-                status = "warning"
-                msg += " — DNS mismatch with Google DoH"
+            all_loopback = all(ip.startswith("127.") for ip in system_ipv4)
+            if not all_loopback:
+                public_ips = _resolve_via_public_dns(domain)
+                dns_mismatch = public_ips is not None and system_ipv4 != public_ips
+                if dns_mismatch and status == "ok":
+                    status = "warning"
+                    msg += " — DNS mismatch with Google DoH"
 
         return make_result(
             "dns",
@@ -2907,20 +2912,15 @@ def print_domain_results(results, color):
 
                 print(f"  DNS (system):    {ip_str}{cisco_flag}{resolver_str}")
 
-                # Show Google DoH reference when tunneled
-                public_ips = details.get("public_dns_ips")
-                if public_ips is not None:
-                    public_str = ", ".join(public_ips)
-                    if details.get("dns_mismatch"):
-                        mismatch_warn = "\u26a0 MISMATCH"
-                        print(f"  DNS (Google):    {color.yellow(public_str)}  {color.yellow(mismatch_warn)}")
-                        print(f"                   {color.dim('Possible stale cache in Cisco DNS path')}")
-                    elif details.get("is_tunneled"):
-                        match_ok = "\u2713 match"
-                        print(f"  DNS (Google):    {public_str}  {color.dim(match_ok)}")
-                elif details.get("is_tunneled"):
-                    hint = "unavailable \u2014 add dns.google to Traffic Steering Bypass"
-                    print(f"  DNS (Google):    {color.dim(hint)}")
+                # Show Google DoH reference only when there's a real mismatch
+                # (system returns non-loopback IPs that differ from Google).
+                # Loopback IPs (proxied/DND) always differ — that's expected, not useful.
+                if details.get("dns_mismatch"):
+                    public_ips = details.get("public_dns_ips", [])
+                    public_str = ", ".join(public_ips) if public_ips else "?"
+                    mismatch_warn = "\u26a0 MISMATCH"
+                    print(f"  DNS (Google):    {color.yellow(public_str)}  {color.yellow(mismatch_warn)}")
+                    print(f"                   {color.dim('Possible stale cache in Cisco DNS path')}")
 
             elif check == "tls":
                 if r["status"] == "error":

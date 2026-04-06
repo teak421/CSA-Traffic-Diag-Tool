@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.1] - 2026-04-05
+
+### Fixed
+- **DNS mismatch false positive on proxied/DND domains** — when Cisco's SWG returns loopback IPs (`127.x.x.x`) for proxied or Do Not Decrypt traffic, the DNS mismatch warning and DoH query are now skipped entirely. Loopback IPs will never match public DNS — this is expected proxy behavior, not a stale cache issue. Saves ~1s latency per proxied domain.
+- **DNS (Google) line only on mismatch** — removed the "✓ match" and "unavailable" display lines. The Google DoH reference now only appears when there's an actual mismatch with real (non-loopback) IPs, reducing noise in the output.
+
 ## [1.6.0] - 2026-04-05
 
 ### Added
