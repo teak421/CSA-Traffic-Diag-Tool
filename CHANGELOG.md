@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2026-04-05
+
+### Added
+- **HTTPS connectivity test** — when Cisco SubCA is detected (traffic decrypted), the tool makes an HTTPS HEAD request to determine whether the system trusts the re-signed certificate, or whether Cisco is actively blocking the domain by policy. Distinguishes "decrypted but connectable" from "blocked by Cisco policy" from "SSL verification failed."
+- **App impact note** — when the system trusts the Cisco CA but apps may not, displays which common apps bundle their own CA store (pip/Python, Docker, Node.js, Git, LM Studio, curl, Go, Ruby) and will reject the re-signed certificate. Recommends trying Do Not Decrypt first, then escalating to Traffic Steering Bypass.
+- **Cisco block page detection** — identifies Cisco Umbrella/SWG block pages by checking HTTP response body for Cisco markers (403 + "cisco umbrella", "this site is blocked", etc.).
+
 ## [1.4.1] - 2026-04-04
 
 ### Fixed

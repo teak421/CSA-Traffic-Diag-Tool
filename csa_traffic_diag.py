@@ -137,6 +137,19 @@ KNOWN_DOMAIN_OWNERS = (
     (".githubusercontent.com", "GitHub"),
 )
 
+# Apps known to bundle their own CA store (ignoring the system trust store).
+# These will reject Cisco's re-signed certificates even when the system trusts them.
+BUNDLED_CA_APPS = (
+    "pip/Python",
+    "Docker",
+    "Node.js",
+    "Git",
+    "LM Studio",
+    "curl",
+    "Go apps",
+    "Ruby/gems",
+)
+
 # Regex for log scanning keywords
 LOG_PATTERNS = re.compile(
     r"\b(block(?:ed)?|deny|denied|drop(?:ped)?|refused|certificate"
@@ -931,6 +944,127 @@ def inspect_tls(domain, port=443):
 
 
 # ---------------------------------------------------------------------------
+# HTTPS connectivity test (when Cisco SubCA detected)
+# ---------------------------------------------------------------------------
+
+
+def _is_cisco_block_page(status_code, body_snippet):
+    """Detect Cisco Secure Access / Umbrella block page from HTTP response."""
+    if not body_snippet:
+        return False
+    lower = body_snippet.lower()
+    markers = (
+        "cisco umbrella",
+        "opendns",
+        "secure access",
+        "this site is blocked",
+        "block page",
+        "web filtering",
+    )
+    return status_code in (403, 302, 307) and any(m in lower for m in markers)
+
+
+def check_https_connectivity(domain, port=443):
+    """Test HTTPS connectivity using the system CA store.
+
+    Only called when Cisco SubCA is detected.  Makes a HEAD request to
+    determine whether the system trusts the re-signed certificate and
+    whether Cisco is actively blocking the domain.
+    """
+    url = f"https://{domain}/" if port == 443 else f"https://{domain}:{port}/"
+    try:
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        req = Request(url, method="HEAD", headers={"User-Agent": "csa_traffic_diag"})
+        with urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
+            return make_result(
+                "https_test",
+                "ok",
+                f"HTTPS {resp.status} \u2014 system trusts Cisco CA",
+                {
+                    "domain": domain,
+                    "status_code": resp.status,
+                    "outcome": "connectable",
+                },
+            )
+    except ssl.SSLCertVerificationError as e:
+        return make_result(
+            "https_test",
+            "warning",
+            "SSL verification failed \u2014 system does NOT trust Cisco CA",
+            {
+                "domain": domain,
+                "outcome": "ssl_error",
+                "error": str(e),
+            },
+        )
+    except URLError as e:
+        if hasattr(e, "code"):
+            code = e.code
+            # 405 = HEAD not allowed, but TLS handshake succeeded
+            if code == 405:
+                return make_result(
+                    "https_test",
+                    "ok",
+                    "HTTPS 405 \u2014 system trusts Cisco CA (HEAD not allowed)",
+                    {
+                        "domain": domain,
+                        "status_code": 405,
+                        "outcome": "connectable",
+                    },
+                )
+            # Check for Cisco block page
+            body = ""
+            try:
+                body = e.read(2048).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if _is_cisco_block_page(code, body):
+                return make_result(
+                    "https_test",
+                    "error",
+                    f"Blocked by Cisco policy ({code})",
+                    {
+                        "domain": domain,
+                        "status_code": code,
+                        "outcome": "blocked",
+                    },
+                )
+            return make_result(
+                "https_test",
+                "warning",
+                f"HTTPS {code} \u2014 server returned error",
+                {
+                    "domain": domain,
+                    "status_code": code,
+                    "outcome": "http_error",
+                },
+            )
+        reason = str(e.reason) if hasattr(e, "reason") else str(e)
+        return make_result(
+            "https_test",
+            "error",
+            f"HTTPS connection failed \u2014 {reason}",
+            {
+                "domain": domain,
+                "outcome": "connection_error",
+                "error": reason,
+            },
+        )
+    except (TimeoutError, OSError) as e:
+        return make_result(
+            "https_test",
+            "error",
+            f"HTTPS connection failed \u2014 {e}",
+            {
+                "domain": domain,
+                "outcome": "connection_error",
+                "error": str(e),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # Traceroute
 # ---------------------------------------------------------------------------
 
@@ -1527,6 +1661,10 @@ def diagnose_domain(domains_str, trace=False):
 
         tls_result = inspect_tls(domain)
         all_results.append(tls_result)
+
+        # HTTPS connectivity test — only when Cisco SubCA detected
+        if tls_result.get("details", {}).get("is_proxied", False):
+            all_results.append(check_https_connectivity(domain))
 
         # Extract resolved IPs from DNS result to pass to route check
         resolved_ips = dns_result.get("details", {}).get("ips", [])
@@ -2407,6 +2545,118 @@ def run_full_diagnosis(domain, minutes=60, trace=False):
     return results
 
 
+def _compute_unified_verdict(tls_details, route_details):
+    """Compute a single unified verdict from TLS and route path signals.
+
+    Returns (label, color_name, explanation, action_hint) where:
+        label       - short verdict string (e.g. "TUNNELED + DECRYPTED")
+        color_name  - "red", "yellow", or "green"
+        explanation - one-line explanation of what the signals mean together
+        action_hint - actionable recommendation or None
+    """
+    # TLS signals
+    tls_proxied = tls_details.get("is_proxied", False) if tls_details else False
+    tls_method = tls_details.get("method") if tls_details else None
+    tls_conclusive = tls_method not in (None, "none", "unknown")
+
+    # Route signals
+    is_tunnel = route_details.get("is_tunnel", False) if route_details else False
+    is_loopback = route_details.get("is_loopback_proxy", False) if route_details else False
+    route_available = bool(route_details and route_details.get("interface"))
+
+    # Both TLS and route available
+    if tls_conclusive and route_available:
+        if tls_proxied and is_tunnel:
+            return (
+                "TUNNELED + DECRYPTED",
+                "red",
+                "Traffic routes through Cisco tunnel and TLS is intercepted (Cisco SubCA in chain)",
+                "Add to Traffic Steering Bypass list",
+            )
+        if tls_proxied and is_loopback:
+            return (
+                "DECRYPTED (local SWG proxy)",
+                "red",
+                "Cisco SWG intercepts locally via loopback proxy (lo0) — TLS is decrypted",
+                "Add to Traffic Steering Bypass or Do Not Decrypt list",
+            )
+        if tls_proxied:
+            return (
+                "DECRYPTED",
+                "red",
+                "Routing is bypassed but Cisco SWG still decrypts TLS (Cisco SubCA in chain)",
+                "Add to Do Not Decrypt list (already bypassed at routing layer)",
+            )
+        if not tls_proxied and is_tunnel:
+            return (
+                "TUNNELED (not decrypted)",
+                "yellow",
+                "Traffic routes through Cisco tunnel but TLS is NOT intercepted (real cert)",
+                "May be on Do Not Decrypt list — verify this is intentional",
+            )
+        if not tls_proxied and is_loopback:
+            return (
+                "ROUTED TO SWG (not decrypted)",
+                "yellow",
+                "Traffic routes to Cisco local proxy but TLS is NOT intercepted (real cert)",
+                "May be on Do Not Decrypt list — verify this is intentional",
+            )
+        # Not proxied, local interface
+        return (
+            "BYPASSED",
+            "green",
+            "Traffic routes locally and TLS shows real certificate — fully bypassed",
+            None,
+        )
+
+    # TLS conclusive, route missing
+    if tls_conclusive:
+        if tls_proxied:
+            return (
+                "DECRYPTED",
+                "red",
+                "Cisco SubCA found in TLS chain (route check unavailable)",
+                "Add to Traffic Steering Bypass or Do Not Decrypt list",
+            )
+        return (
+            "NOT DECRYPTED",
+            "green",
+            "Real certificate — no Cisco interception detected (route check unavailable)",
+            None,
+        )
+
+    # TLS inconclusive, route available
+    if route_available:
+        if is_loopback:
+            return (
+                "SWG INTERCEPTED",
+                "red",
+                "TLS probe inconclusive but traffic routes to Cisco local SWG proxy (lo0)",
+                "Add to Traffic Steering Bypass list",
+            )
+        if is_tunnel:
+            return (
+                "TUNNELED",
+                "yellow",
+                "TLS probe inconclusive — traffic routes through Cisco tunnel interface",
+                "Domain may need Do Not Decrypt or Traffic Steering Bypass",
+            )
+        return (
+            "BYPASSED (routing)",
+            "green",
+            "TLS probe inconclusive but traffic routes through local interface — bypassed at network layer",
+            None,
+        )
+
+    # Neither available
+    return (
+        "UNABLE TO DETERMINE",
+        "yellow",
+        "Both TLS and route checks unavailable",
+        "Check DNS resolution and network connectivity",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
@@ -2452,11 +2702,19 @@ def print_domain_results(results, color):
 
     for domain, checks in domain_results.items():
         print(f"\n{color.bold(f'[Domain Check: {domain}]')}")
-        tls_conclusive = False  # Track whether TLS gave a clear answer
+
+        # Pre-collect TLS and route results for unified verdict
+        tls_result = None
+        route_result = None
+        for r in checks:
+            if r["check"] == "tls":
+                tls_result = r
+            elif r["check"] == "route_path":
+                route_result = r
+
         for r in checks:
             check = r["check"]
             details = r.get("details", {})
-            icon = color.status_icon(r["status"])
 
             if check == "dns":
                 ips = details.get("ips", [])
@@ -2465,9 +2723,21 @@ def print_domain_results(results, color):
                 if details.get("is_cisco_dns"):
                     cisco_flag = color.yellow(" (Cisco/OpenDNS IP!)")
 
-                # Show resolver label
+                # Show resolver label, with clarification when bypassed
                 resolver_label = details.get("resolver_label")
-                resolver_str = color.dim(f"  (via {resolver_label})") if resolver_label else ""
+                if resolver_label:
+                    route_d = route_result.get("details", {}) if route_result else {}
+                    is_bypassed = (
+                        route_d.get("interface")
+                        and not route_d.get("is_tunnel")
+                        and not route_d.get("is_loopback_proxy")
+                    )
+                    if is_bypassed and "cisco" in resolver_label.lower():
+                        resolver_str = color.dim(f"  (via {resolver_label} — DNS only, traffic routes locally)")
+                    else:
+                        resolver_str = color.dim(f"  (via {resolver_label})")
+                else:
+                    resolver_str = ""
 
                 print(f"  DNS (system):    {ip_str}{cisco_flag}{resolver_str}")
 
@@ -2476,10 +2746,12 @@ def print_domain_results(results, color):
                 if public_ips is not None:
                     public_str = ", ".join(public_ips)
                     if details.get("dns_mismatch"):
-                        print(f"  DNS (Google):    {color.yellow(public_str)}  {color.yellow('⚠ MISMATCH')}")
+                        mismatch_warn = "\u26a0 MISMATCH"
+                        print(f"  DNS (Google):    {color.yellow(public_str)}  {color.yellow(mismatch_warn)}")
                         print(f"                   {color.dim('Possible stale cache in Cisco DNS path')}")
                     elif details.get("is_tunneled"):
-                        print(f"  DNS (Google):    {public_str}  {color.dim('✓ match')}")
+                        match_ok = "\u2713 match"
+                        print(f"  DNS (Google):    {public_str}  {color.dim(match_ok)}")
                 elif details.get("is_tunneled"):
                     hint = "unavailable \u2014 add dns.google to Traffic Steering Bypass"
                     print(f"  DNS (Google):    {color.dim(hint)}")
@@ -2487,52 +2759,75 @@ def print_domain_results(results, color):
             elif check == "tls":
                 if r["status"] == "error":
                     print(f"  TLS Check:       {color.red(r['message'])}")
-                    print()
-                    print(f"  {icon} Verdict:       {color.yellow('UNABLE TO DETERMINE')}")
                 elif details.get("method") == "none":
-                    # Server rejected TLS probe — use chain_display which has context-specific text
                     print(f"  TLS Check:       {color.dim(details.get('chain_display', 'not inspectable'))}")
                 else:
-                    tls_conclusive = True
                     chain_str = details.get("chain_display", "(unknown)")
                     print(f"  TLS Chain:       {chain_str}")
-
                     if details.get("is_proxied"):
                         print(f"  Cisco SubCA:     {color.yellow('FOUND')} \u26a0\ufe0f")
-                        print()
-                        print(
-                            f"  {icon} Verdict:       {color.red(details.get('verdict', 'PROXIED / DECRYPTED'))}"
-                            f" \u2014 add to Traffic Steering Bypass"
-                        )
                     else:
                         print(f"  Cisco SubCA:     {color.green('NOT FOUND')}")
-                        print()
-                        print(f"  {icon} Verdict:       {color.green(details.get('verdict', 'DIRECT / BYPASSED'))}")
+
+            elif check == "https_test":
+                outcome = details.get("outcome", "unknown")
+                if outcome == "connectable":
+                    code = details.get("status_code", "?")
+                    print(f"  HTTPS Test:      {color.green(f'{code} OK')} \u2014 system trusts Cisco CA")
+                    apps = ", ".join(BUNDLED_CA_APPS)
+                    print(f"  {color.yellow('App Impact:')}      Apps with bundled CA stores ({apps})")
+                    print(f"                   {color.dim('will reject the re-signed certificate')}")
+                    hint = "\u2192 Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed"
+                    print(f"                   {color.dim(hint)}")
+                elif outcome == "blocked":
+                    code = details.get("status_code", "?")
+                    print(f"  HTTPS Test:      {color.red(f'Blocked by Cisco policy ({code})')}")
+                elif outcome == "ssl_error":
+                    print(f"  HTTPS Test:      {color.red('SSL error')} \u2014 system does NOT trust Cisco CA")
+                    hint = "Install Cisco CA cert in Keychain and set to Always Trust"
+                    print(f"                   {color.dim(hint)}")
+                else:
+                    err = details.get("error", "unknown error")
+                    print(f"  HTTPS Test:      {color.red('Connection failed')} \u2014 {err}")
 
             elif check == "route_path":
-                # Only show route path when TLS didn't give a clear answer
-                if tls_conclusive:
-                    continue
-                iface = details.get("interface", "unknown")
-                target_ip = details.get("target_ip", "")
-                is_tunnel = details.get("is_tunnel", False)
-                gateway = details.get("gateway", "")
-
-                gw_str = f" via {gateway}" if gateway else ""
-                print(f"  Route Path:      {target_ip} \u2192 {iface}{gw_str}")
-                print()
-                if details.get("is_loopback_proxy"):
-                    print(f"  {icon} KDF Verdict:   {color.red('PROXIED')} \u2014 Cisco local SWG proxy (lo0)")
-                elif is_tunnel:
-                    print(f"  {icon} KDF Verdict:   {color.red('TUNNELED')} \u2014 TSB not active for this domain")
+                if not details.get("interface"):
+                    print(f"  Route Path:      {color.dim(r['message'])}")
                 else:
-                    print(f"  {icon} KDF Verdict:   {color.green('BYPASSED')} \u2014 traffic routes locally")
+                    iface = details.get("interface", "unknown")
+                    target_ip = details.get("target_ip", "")
+                    gateway = details.get("gateway") or details.get("next_hop", "")
+                    gw_str = f" via {gateway}" if gateway else ""
+                    print(f"  Route Path:      {target_ip} \u2192 {iface}{gw_str}")
 
             elif check == "traceroute":
                 hops = details.get("hops", [])
                 print(f"  Traceroute:      {len(hops)} hops")
                 for hop in hops:
                     print(f"    {color.dim(hop)}")
+
+        # Unified verdict
+        tls_d = tls_result.get("details", {}) if tls_result else None
+        route_d = route_result.get("details", {}) if route_result else None
+        label, color_name, explanation, action_hint = _compute_unified_verdict(tls_d, route_d)
+
+        # Pick worst-case status for the icon
+        severity = {"error": 2, "warning": 1, "ok": 0}
+        statuses = []
+        if tls_result:
+            statuses.append(tls_result.get("status", "ok"))
+        if route_result:
+            statuses.append(route_result.get("status", "ok"))
+        worst = max(statuses, key=lambda s: severity.get(s, 0)) if statuses else "ok"
+        icon = color.status_icon(worst)
+
+        color_fn = getattr(color, color_name)
+        print()
+        print(f"  {icon} Verdict:       {color_fn(label)}")
+        print(f"                   {color.dim(explanation)}")
+        if action_hint:
+            arrow = color.yellow("\u2192")
+            print(f"                   {arrow} {action_hint}")
 
     for r in other_results:
         print(f"  {color.status_icon(r['status'])} {r['message']}")
@@ -3425,7 +3720,7 @@ def main():
 
         if not args.json:
             # Separate domain results from status/log results
-            domain_checks = ("dns", "tls", "traceroute", "egress_ip", "route_path")
+            domain_checks = ("dns", "tls", "https_test", "traceroute", "egress_ip", "route_path")
             domain_results = [r for r in results if r["check"] in domain_checks]
             log_results = [r for r in results if r["check"] == "log_scan"]
             status_results = [r for r in results if r["check"] not in domain_checks and r["check"] != "log_scan"]
