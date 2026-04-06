@@ -2380,6 +2380,160 @@ def _scan_system_log_macos(minutes):
     return entries
 
 
+# Domains to exclude from unaccounted DNS results (system noise)
+_UNACCOUNTED_NOISE_SUFFIXES = (
+    ".local",
+    ".arpa",
+    ".internal",
+    ".apple.com",
+    ".icloud.com",
+    ".apple-cloudkit.com",
+    ".mzstatic.com",
+    ".push.apple.com",
+    ".cisco.com",
+    ".umbrella.com",
+    ".opendns.com",
+    ".strln.net",
+    ".microsoft.com",
+    ".windows.com",
+    ".windows.net",
+    ".office.com",
+    ".office365.com",
+    ".live.com",
+    ".digicert.com",
+    ".verisign.com",
+    ".symantec.com",
+    ".googlevideo.com",
+    ".ytimg.com",
+    ".youtube.com",
+    ".googleapis.com",
+    ".gstatic.com",
+    ".sharepoint.com",
+    ".5c10.org",
+)
+_UNACCOUNTED_NOISE_PREFIXES = (
+    "ocsp.",
+    "crl.",
+    "_dns-sd.",
+    "_sips.",
+    "_stun.",
+    "_tcp.",
+    "_udp.",
+    "_tls.",
+    "time.",
+    "ntp.",
+    "stun0",
+)
+# Domains used by this tool itself (egress IP checks, DoH, bypass check)
+_TOOL_DOMAINS = frozenset(
+    {
+        "ifconfig.me",
+        "api.ipify.org",
+        "icanhazip.com",
+        "checkip.amazonaws.com",
+        "ipchicken.com",
+        "dns.google",
+        "cloudflare-dns.com",
+    }
+)
+
+
+def _scan_host_firewall_macos(minutes):
+    """Scan Cisco host_firewall logs for DNS queries with domain names.
+
+    Parses the CSV-formatted host_firewall entries from the Cisco network
+    extension to extract every domain the system resolved, along with the
+    requesting process.  These entries are invisible to the normal Cisco
+    diagnostic log pipeline (they only contain ALLOW/DENY, no error/block
+    keywords).
+
+    Returns dict[domain, {"count": int, "processes": set[str]}].
+    """
+    domains = {}
+    try:
+        proc = subprocess.run(
+            [
+                "log",
+                "show",
+                "--predicate",
+                'process CONTAINS "cisco" AND category == "host_firewall"',
+                "--last",
+                f"{minutes}m",
+                "--style",
+                "compact",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=max(10, min(120, minutes * 2)),
+        )
+        for line in proc.stdout.splitlines():
+            if "host_firewall" not in line:
+                continue
+            # Extract the CSV portion after [contentfilter:host_firewall]
+            idx = line.find("host_firewall]")
+            if idx < 0:
+                continue
+            csv_part = line[idx + len("host_firewall]") :].strip()
+            fields = csv_part.split(",")
+            # Fields: ts, proto, src_ip, src_port, dst_ip, dst_port, verdict,
+            #         direction, pid, "process_path", "domain", ...
+            if len(fields) < 11:
+                continue
+            # Only care about outgoing DNS queries (port 53) with a domain
+            dst_port = fields[5].strip()
+            direction = fields[7].strip()
+            if dst_port != "53" or direction != "OUTGOING":
+                continue
+            # Domain is field 10 (0-indexed), quoted
+            domain = fields[10].strip().strip('"')
+            if not domain:
+                continue
+            # Process name from field 9
+            proc_path = fields[9].strip().strip('"')
+            proc_name = proc_path.rsplit("/", 1)[-1] if proc_path else ""
+
+            if domain not in domains:
+                domains[domain] = {"count": 0, "processes": set()}
+            domains[domain]["count"] += 1
+            if proc_name:
+                domains[domain]["processes"].add(proc_name)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return domains
+
+
+def _is_unaccounted_noise(domain):
+    """Return True if domain is system noise that should be excluded from unaccounted DNS."""
+    dl = domain.lower()
+    if "." not in dl:
+        return True
+    if dl in _TOOL_DOMAINS:
+        return True
+    if any(dl.endswith(s) for s in _UNACCOUNTED_NOISE_SUFFIXES):
+        return True
+    if any(dl.startswith(p) for p in _UNACCOUNTED_NOISE_PREFIXES):
+        return True
+    return False
+
+
+def _diff_unaccounted_domains(firewall_domains, cisco_log_domains):
+    """Return domains from firewall that are NOT in Cisco's diagnostic logs.
+
+    Filters out noise (system infrastructure, OCSP, mDNS, etc.) and domains
+    already captured by the normal log pipeline.
+    """
+    unaccounted = {}
+    for domain, info in firewall_domains.items():
+        if domain in cisco_log_domains:
+            continue
+        if _is_unaccounted_noise(domain):
+            continue
+        if _is_process_identifier(domain):
+            continue
+        unaccounted[domain] = info
+    return unaccounted
+
+
 def scan_logs_macos(minutes=60, domain_filter=None):
     """Scan all Cisco Secure Client log sources on macOS."""
     all_entries = []
@@ -3190,6 +3344,14 @@ def discover_traffic(minutes=60, verify=False):
                 group_info["tls_verdict"] = "NOT DECRYPTED"
                 not_decrypted[base] = group_info
 
+    # Unaccounted DNS: domains the network extension saw but the diagnostic
+    # pipeline didn't capture (silently decrypted / allowed without keywords).
+    unaccounted = {}
+    if IS_MACOS:
+        firewall_domains = _scan_host_firewall_macos(minutes)
+        cisco_log_domains = set(all_discovered.keys())
+        unaccounted = _diff_unaccounted_domains(firewall_domains, cisco_log_domains)
+
     return {
         # Log-based categories (used when --verify is not set)
         "bypassed": bypassed_summary,
@@ -3203,6 +3365,7 @@ def discover_traffic(minutes=60, verify=False):
         "tls_results": tls_results,
         # Common
         "process_errors": process_entries,
+        "unaccounted": unaccounted,
         "minutes": minutes,
         "total_entries": log_result.get("details", {}).get("total_entries", 0),
     }
@@ -3230,6 +3393,38 @@ def print_discover_results(discovery, color, verbose=False):
         proc_count = proc.get("count", 0)
         print(f"\n  {color.bold(color.dim('PROCESS-LEVEL'))} (no domain \u2014 flow/kernel events):")
         print(f"    {color.dim(f'{proc_count} events: {kw_str}')}")
+
+    # Unaccounted DNS (domains seen by network extension but not in diagnostic logs)
+    unaccounted = discovery.get("unaccounted", {})
+    if unaccounted:
+        label = color.bold(color.yellow("UNACCOUNTED DNS"))
+        print(f"\n  {label} (resolved but not in Cisco diagnostic logs):")
+
+        # Group by base domain for cleaner display
+        groups = _group_by_base_domain(list(unaccounted.keys()))
+        grouped_display = []
+        for base, members in groups.items():
+            total = sum(unaccounted[d]["count"] for d in members)
+            all_procs = set()
+            for d in members:
+                all_procs.update(unaccounted[d].get("processes", set()))
+            grouped_display.append((base, members, total, all_procs))
+
+        for base, members, total, procs in sorted(grouped_display, key=lambda x: -x[2]):
+            proc_str = color.dim(f"  ({', '.join(sorted(procs))})") if procs else ""
+            if len(members) == 1:
+                print(f"    {members[0]:<50s} {color.dim(f'{total}x')}{proc_str}")
+            else:
+                padding = max(1, 37 - len(base))
+                print(f"    *.{base} ({len(members)} domains){' ' * padding}{color.dim(f'{total}x')}{proc_str}")
+                if verbose:
+                    for m in sorted(members):
+                        print(f"      {color.dim(m)}")
+
+        print()
+        print(f"    {color.dim('These may be silently decrypted \u2014 apps with bundled CA stores will fail')}")
+        hint = "Run: csa-traffic-diag -d <domain> to check TLS interception status"
+        print(f"    {color.dim(hint)}")
 
     # Recommendations (only in verify mode)
     if verified:

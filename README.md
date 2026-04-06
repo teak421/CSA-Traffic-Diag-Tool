@@ -97,6 +97,7 @@ sudo csa-traffic-diag --discover -v
 - **BYPASSED** -- domains with bypass keywords in logs
 - **BLOCKED** -- domains denied by policy (block/deny/drop/refused)
 - **ERRORS** -- domains with TLS failures, timeouts, certificate errors
+- **UNACCOUNTED DNS** -- domains resolved by the system but not in Cisco's diagnostic logs (macOS only). These are discovered by scanning Cisco's network extension firewall logs for DNS queries, then diffing against the diagnostic pipeline. Catches silently decrypted domains that break apps with bundled CA stores (see [Troubleshooting Walkthrough](#troubleshooting-walkthrough-app-not-working))
 
 #### With `--verify`: TLS Verification
 
@@ -291,13 +292,82 @@ Cisco ZTA's SWG module can intercept DNS and return loopback IPs (`127.x.x.x`) t
 
 The tool reads Cisco Secure Client log files and databases, matching lines against keywords (`block`, `deny`, `error`, `timeout`, `certificate`, `decrypt`, `bypass`), extracting domain names and timestamps, and grouping results by domain with frequency counts.
 
-## Common Scenarios
+## Troubleshooting Walkthrough: App Not Working
 
-### "An app can't connect / download / authenticate"
+This is the recommended diagnostic flow when an app stops working with Cisco Secure Access connected. The example uses a desktop app (LM Studio) that can't download AI models, but the same steps apply to any app that breaks -- Docker pulls, pip installs, Git clones, etc.
+
+### Step 1: Reproduce the failure
+
+Use the broken app and trigger the failing action (download, login, sync, etc.). This ensures the relevant domains appear in the logs.
+
+### Step 2: Scan for blocked domains
+
 ```bash
-sudo csa-traffic-diag -d huggingface.co
+sudo csa-traffic-diag --discover --minutes 10
 ```
-If you see `Cisco SubCA: FOUND` with `HTTPS Test: 200 OK` and an `App Impact` note, the app is rejecting Cisco's re-signed certificate. Add the domain to **Do Not Decrypt** first; escalate to **Traffic Steering Bypass** if issues persist.
+
+Check the **BLOCKED** section. If the domain appears here, Cisco is actively denying it by policy -- you'll see it with `block`/`deny`/`refused` keywords. This is the straightforward case: adjust your Cisco policy to allow the domain.
+
+### Step 3: Check UNACCOUNTED DNS
+
+If nothing shows in BLOCKED (the common case for TLS decryption issues), scroll to the **UNACCOUNTED DNS** section. This shows every domain the machine resolved that Cisco didn't log in its diagnostic pipeline -- the "silent decryption" blind spot.
+
+```
+  UNACCOUNTED DNS (resolved but not in Cisco diagnostic logs):
+    *.lmstudio.ai (2 domains)                          4x  (LM Studio)
+      lmstudio.ai
+      search.lmstudio.ai
+```
+
+The app name in parentheses tells you which process made the DNS query. If you see your broken app's domains here, they're likely being silently decrypted.
+
+### Step 4: Confirm TLS interception
+
+Run a domain check on the suspicious domains:
+
+```bash
+sudo csa-traffic-diag -d lmstudio.ai,search.lmstudio.ai
+```
+
+Look for:
+- **`Cisco SubCA: FOUND`** -- confirms Cisco is decrypting the connection
+- **`HTTPS Test: SSL error`** -- confirms the system can't even verify the re-signed cert
+- **`App Impact`** -- lists which types of apps will reject the certificate
+
+```
+  TLS Chain:       CN=lmstudio.ai
+  Cisco SubCA:     FOUND
+  HTTPS Test:      SSL error -- system does NOT trust Cisco CA
+  App Impact:      Apps with bundled CA stores (pip/Python, Docker, Node.js, Git, LM Studio, curl, Go apps, Ruby/gems)
+                   will reject the re-signed certificate
+                   -> Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed
+```
+
+### Step 5: Add to Do Not Decrypt
+
+> **Always start with Do Not Decrypt.** DND keeps traffic proxied through Cisco (maintaining visibility and policy enforcement) but skips TLS interception -- the app sees the real certificate and connects successfully. Only escalate to Traffic Steering Bypass if DND doesn't resolve the issue.
+
+In the Cisco Secure Access dashboard, add the identified domains to the **Do Not Decrypt** list, then sync the ZTA client.
+
+**DND changes take effect immediately** after a ZTA client sync ("Sync Now" in the Cisco Secure Client UI). Traffic Steering Bypass changes require the client to update its local routing rules, which can take several minutes even after a sync -- another reason to start with DND.
+
+### Step 6: Verify the fix
+
+```bash
+sudo csa-traffic-diag -d lmstudio.ai
+```
+
+You should now see:
+- **`Cisco SubCA: NOT FOUND`** -- real certificate, not Cisco's
+- The app should work
+
+If the app still doesn't work after DND, escalate to **Traffic Steering Bypass** (see [Bypass vs. Do Not Decrypt](#bypass-vs-do-not-decrypt)).
+
+### Why Cisco doesn't log these failures
+
+When Cisco SWG decrypts HTTPS traffic, it re-signs the certificate with a Cisco CA. From Cisco's perspective, the proxy succeeded -- it completed the TLS handshake and forwarded the traffic. The failure happens at the **app level**: the app's HTTP client rejects the Cisco certificate because it doesn't trust the Cisco CA. Cisco never sees this rejection, so there's no log entry. The UNACCOUNTED DNS feature bridges this gap by showing you which domains apps are trying to reach outside of Cisco's diagnostic visibility.
+
+## Other Common Scenarios
 
 ### "Netflix/streaming is buffering or won't load"
 ```bash
@@ -335,6 +405,17 @@ csa-traffic-diag --status
 ```
 
 ## Interpreting Results
+
+### When will you see a BLOCKED entry?
+
+Cisco logs a **BLOCKED** entry when its policy explicitly denies a domain -- web filtering categories, custom block lists, malware/phishing detection, or DNS-layer security policies. You'll see these with `block`/`deny`/`refused` keywords in the `--discover` output.
+
+You will **NOT** see a BLOCKED entry when:
+- Cisco silently decrypts the traffic and the **app** rejects the re-signed certificate (the most common cause of app breakage)
+- The domain is on Do Not Decrypt (traffic passes through without interception)
+- The domain is on Traffic Steering Bypass (traffic doesn't go through Cisco at all)
+
+This is why the **UNACCOUNTED DNS** section exists -- it catches the domains that Cisco handles silently.
 
 ### Not every TLS error means something is broken
 

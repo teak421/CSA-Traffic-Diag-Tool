@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - 2026-04-05
+
+### Added
+- **Unaccounted DNS discovery** (macOS) — scans Cisco's network extension `host_firewall` system logs for every DNS query the machine made, diffs against domains already captured by the diagnostic pipeline, and surfaces the difference as "UNACCOUNTED DNS." These are domains flowing through Cisco that aren't appearing in diagnostic logs — typically silently decrypted domains that break apps with bundled CA stores (pip, Docker, LM Studio, Git, etc.). Includes requesting process name attribution (e.g., `(LM Studio)`, `(Safari)`).
+- **Base domain grouping** in UNACCOUNTED DNS — groups subdomains under `*.base.com (N domains)` to reduce noise, with `-v` to expand individual domains.
+- **Noise filtering** — excludes system infrastructure (Apple, Microsoft, Cisco, YouTube/Google Video, OCSP/CRL), the tool's own domains (ifconfig.me, ipchicken.com, dns.google), and SRV/STUN service discovery records from unaccounted results.
+- **Troubleshooting walkthrough** in README — step-by-step diagnostic flow from "app is broken" through UNACCOUNTED DNS discovery, TLS confirmation, DND fix, and verification. Uses a real-world LM Studio example.
+- **"When will you see a BLOCKED entry?"** section in README — explains Cisco's silent decryption blind spot and why UNACCOUNTED DNS exists.
+
+### Changed
+- README restructured with DND-first guidance throughout: callout box emphasizing "Always start with Do Not Decrypt," note that DND takes effect immediately after sync while TSB requires several minutes.
+
 ## [1.5.1] - 2026-04-05
 
 ### Fixed
