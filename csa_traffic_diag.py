@@ -999,6 +999,18 @@ def check_https_connectivity(domain, port=443):
             },
         )
     except URLError as e:
+        # urlopen wraps SSLCertVerificationError inside URLError
+        if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+            return make_result(
+                "https_test",
+                "warning",
+                "SSL verification failed \u2014 system does NOT trust Cisco CA",
+                {
+                    "domain": domain,
+                    "outcome": "ssl_error",
+                    "error": str(e.reason),
+                },
+            )
         if hasattr(e, "code"):
             code = e.code
             # 405 = HEAD not allowed, but TLS handshake succeeded
@@ -2571,14 +2583,14 @@ def _compute_unified_verdict(tls_details, route_details):
                 "TUNNELED + DECRYPTED",
                 "red",
                 "Traffic routes through Cisco tunnel and TLS is intercepted (Cisco SubCA in chain)",
-                "Add to Traffic Steering Bypass list",
+                "Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed",
             )
         if tls_proxied and is_loopback:
             return (
                 "DECRYPTED (local SWG proxy)",
                 "red",
                 "Cisco SWG intercepts locally via loopback proxy (lo0) — TLS is decrypted",
-                "Add to Traffic Steering Bypass or Do Not Decrypt list",
+                "Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed",
             )
         if tls_proxied:
             return (
@@ -2616,7 +2628,7 @@ def _compute_unified_verdict(tls_details, route_details):
                 "DECRYPTED",
                 "red",
                 "Cisco SubCA found in TLS chain (route check unavailable)",
-                "Add to Traffic Steering Bypass or Do Not Decrypt list",
+                "Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed",
             )
         return (
             "NOT DECRYPTED",
@@ -2632,7 +2644,7 @@ def _compute_unified_verdict(tls_details, route_details):
                 "SWG INTERCEPTED",
                 "red",
                 "TLS probe inconclusive but traffic routes to Cisco local SWG proxy (lo0)",
-                "Add to Traffic Steering Bypass list",
+                "Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed",
             )
         if is_tunnel:
             return (
@@ -2784,7 +2796,12 @@ def print_domain_results(results, color):
                     print(f"  HTTPS Test:      {color.red(f'Blocked by Cisco policy ({code})')}")
                 elif outcome == "ssl_error":
                     print(f"  HTTPS Test:      {color.red('SSL error')} \u2014 system does NOT trust Cisco CA")
-                    hint = "Install Cisco CA cert in Keychain and set to Always Trust"
+                    fix = "Install Cisco CA cert in Keychain and set to Always Trust"
+                    print(f"                   {color.dim(fix)}")
+                    apps = ", ".join(BUNDLED_CA_APPS)
+                    print(f"  {color.yellow('App Impact:')}      Apps with bundled CA stores ({apps})")
+                    print(f"                   {color.dim('will also reject the re-signed certificate')}")
+                    hint = "\u2192 Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed"
                     print(f"                   {color.dim(hint)}")
                 else:
                     err = details.get("error", "unknown error")
