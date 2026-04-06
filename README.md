@@ -97,7 +97,7 @@ sudo csa-traffic-diag --discover -v
 - **BYPASSED** -- domains with bypass keywords in logs
 - **BLOCKED** -- domains denied by policy (block/deny/drop/refused)
 - **ERRORS** -- domains with TLS failures, timeouts, certificate errors
-- **UNACCOUNTED DNS** -- domains resolved by the system but not in Cisco's diagnostic logs (macOS only). These are discovered by scanning Cisco's network extension firewall logs for DNS queries, then diffing against the diagnostic pipeline. Catches silently decrypted domains that break apps with bundled CA stores (see [Troubleshooting Walkthrough](#troubleshooting-walkthrough-app-not-working))
+- **UNACCOUNTED DNS** -- domains resolved by the system but not in Cisco's diagnostic logs. Discovered by scanning Cisco's network extension firewall logs for DNS queries, then diffing against the diagnostic pipeline. Catches silently decrypted domains that break apps with bundled CA stores (see [Troubleshooting Walkthrough](#troubleshooting-walkthrough-app-not-working)). Currently macOS; Windows support planned.
 
 #### With `--verify`: TLS Verification
 
