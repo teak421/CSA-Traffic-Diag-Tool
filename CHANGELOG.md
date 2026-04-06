@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.1] - 2026-04-05
+
+### Fixed
+- **SSL error detection in HTTPS test** — `urlopen` wraps `SSLCertVerificationError` inside `URLError`, which caused the SSL error to display as a generic "Connection failed" instead of the specific "SSL error — system does NOT trust Cisco CA" message with Keychain fix instructions.
+- **App impact note on SSL errors** — the app impact note and DND-first guidance now also appear when the system itself doesn't trust the Cisco CA (not just when the system trusts it but apps don't).
+- **Consistent DND-first guidance** — all verdict text standardized to "Try Do Not Decrypt first, escalate to Traffic Steering Bypass if needed" instead of the previous "Add to Traffic Steering Bypass" wording.
+
 ## [1.5.0] - 2026-04-05
 
 ### Added
